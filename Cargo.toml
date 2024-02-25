@@ -1,0 +1,46 @@
+[package]
+name = "esp32-audio"
+version = "0.1.0"
+authors = ["maxwen <max.weninger@gmail.com>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+esp32-hal = { version = "0.18.0", features = ["embassy", "embassy-time-timg0", "embassy-executor-thread", "async", "psram-2m"] }
+esp-backtrace = { version = "0.10.0", features = ["esp32", "panic-handler", "exception-handler", "print-uart", "colors", "esp-println"] }
+esp-println = { version = "0.8.0", features = ["esp32", "log"] }
+esp-wifi = { version = "0.3.0", features = ["esp32", "wifi", "embassy-net"] }
+heapless = { version = "0.7.15", default-features = false, features = ["serde"] }
+log = { version = "0.4.18" }
+esp-alloc = { version = "0.3.0" }
+byteorder = { version = "1", default-features = false }
+static_cell = { version = "2.0.0", features = ["nightly"] }
+
+embassy-time = { version = "0.3.0" }
+embassy-executor = { version = "0.5.0", features = ["nightly", "integrated-timers"] }
+embassy-sync = "0.5.0"
+embassy-net = { version = "0.4.0", features = ["tcp", "udp", "dhcpv4", "medium-ethernet", "dns"] }
+embassy-embedded-hal = { version = "0.1.0" }
+embassy-futures = "0.1.1"
+rust_utils = { path = "/home/maxl/esp32/rust/utils" }
+ili9341 = { path = "/home/maxl/esp32/rust/ili9341-rs" }
+display-interface-spi = "0.4.1"
+embedded-graphics = "0.8.1"
+embedded-svc = { version = "0.27.0", default-features = false, features = ["log", "use_serde"] }
+embedded-hal = "1.0.0"
+embedded-hal-bus = { version = "0.1.0", features = ["async"] }
+embedded-hal-async = "1.0.0"
+embedded-sdmmc = { version = "0.7.0" }
+reqwless = { version = "0.11.0", features = ["alloc"] }
+rmp3 = {  version = "0.3", default-features = false }
+
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+
+[patch.crates-io]
+esp-hal-common = { path = "/home/maxl/esp32/rust/esp-hal/esp-hal-common" }
+reqwless = { path = "/home/maxl/esp32/rust/reqwless" }
+rmp3 = { path = "/home/maxl/esp32/rust/rmp3" }
