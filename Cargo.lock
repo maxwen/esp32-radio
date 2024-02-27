@@ -419,6 +419,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eg-seven-segment"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e7d2f54ed234b333c71865c641906175a0d58bf366534ba5b8ded74b524b87b"
+dependencies = [
+ "bitflags 2.4.2",
+ "embedded-graphics",
+]
+
+[[package]]
 name = "elliptic-curve"
 version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -952,6 +962,7 @@ version = "0.1.0"
 dependencies = [
  "byteorder",
  "display-interface-spi",
+ "eg-seven-segment",
  "embassy-embedded-hal",
  "embassy-executor",
  "embassy-futures",
@@ -972,6 +983,7 @@ dependencies = [
  "heapless 0.7.17",
  "ili9341",
  "log",
+ "profont",
  "reqwless",
  "rmp3",
  "rust_utils",
@@ -1724,6 +1736,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2422ad645d89c99f8f3e6b88a9fdeca7fabeac836b1002371c4367c8f984aae"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "profont"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "016681370a9dd6e7ddb4c1a959922fd59dc45e5ebaa5ff5b13090267898ced34"
+dependencies = [
+ "embedded-graphics",
 ]
 
 [[package]]

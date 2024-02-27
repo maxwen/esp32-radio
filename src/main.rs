@@ -4,9 +4,10 @@
 
 extern crate alloc;
 
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::alloc::GlobalAlloc;
+use core::alloc::{GlobalAlloc, Layout};
 use core::cell::RefCell;
 use core::fmt::Write;
 use core::str::from_utf8_unchecked;
@@ -21,21 +22,31 @@ use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_sync::{blocking_mutex, mutex};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Timer};
+use embedded_graphics::draw_target::DrawTarget;
+use embedded_graphics::Drawable;
+use embedded_graphics::geometry::Point;
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
+use embedded_graphics::text::{Text, TextStyle};
+use embedded_graphics::text::renderer::TextRenderer;
 use embedded_hal_async::i2c::I2c;
 use embedded_svc::io::asynch::BufRead;
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
-use esp32_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
+use esp32_hal::{clock::ClockControl, dma_buffers, embassy, IO, peripherals::Peripherals, prelude::*, psram};
 use esp32_hal::{Rng, timer::TimerGroup};
 use esp32_hal::clock::Clocks;
+use esp32_hal::dma::DmaPriority;
 use esp32_hal::gpio::NO_PIN;
 use esp32_hal::i2c::I2C;
+use esp32_hal::i2s::asynch::I2sWriteDmaAsync;
+use esp32_hal::i2s::{DataFormat, I2s, I2sWriteDma, Standard};
 use esp32_hal::ledc::{channel, HighSpeed, LEDC, timer};
+use esp32_hal::pdma::Dma;
 use esp32_hal::spi::master::{Instance, Spi};
 use esp32_hal::spi::SpiMode;
 use esp_backtrace;
-use esp_println::{print, println};
+use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize};
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 use heapless::String;
@@ -44,10 +55,17 @@ use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
 use reqwless::request::Method::GET;
 use reqwless::request::RequestBuilder;
 use reqwless::response::Status;
-use rmp3::{Frame, MAX_SAMPLES_PER_FRAME, RawDecoder, Sample};
+use rmp3::{MAX_SAMPLES_PER_FRAME, RawDecoder, Sample};
+use rmp3::Frame;
 use rust_utils::dummy_pin::DummyPin;
 use static_cell::make_static;
 use static_cell::StaticCell;
+
+use crate::fonts::CharacterStyles;
+use crate::sdcard::SdcardManager;
+
+mod fonts;
+mod sdcard;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
@@ -61,7 +79,27 @@ fn init_psram_heap() {
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 
-static STREAM_CHANNEL: Channel<CriticalSectionRawMutex, [u8; 8192], 4> = Channel::new();
+// in psram
+const STREAM_BUFFER_SIZE: usize = 1024 * 16;
+
+// static STREAM_CHANNEL: Channel<CriticalSectionRawMutex, [u8; STREAM_BUFFER_SIZE], 4> = Channel::new();
+
+
+const MAX_SAMPLES_PER_FRAME_BYTE: usize = MAX_SAMPLES_PER_FRAME * 2;
+
+// in psram
+const FRAME_BUFFER_SIZE: usize = MAX_SAMPLES_PER_FRAME_BYTE * 16;
+const I2S_BUFFER_SIZE: usize = 8192;
+
+const META_DATA_TITLE_LEN_MAX: usize = 256;
+
+struct MetaData {
+    title: String<META_DATA_TITLE_LEN_MAX>,
+}
+
+static META_DATA_SIGNAL: Signal<CriticalSectionRawMutex, MetaData> = Signal::new();
+
+static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, [i16; MAX_SAMPLES_PER_FRAME], 8> = Channel::new();
 
 macro_rules! singleton {
     ($val:expr, $typ:ty) => {{
@@ -109,17 +147,20 @@ async fn connection(mut controller: WifiController<'static>) {
 }
 
 #[embassy_executor::task]
-pub async fn test_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
+pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
     let mut url: String<1024> = String::new();
-    // write!(url, "http://orf-live.ors-shoutcast.at/fm4-q2a").unwrap();
-    // write!(url, "http://192.168.1.15:8080/stream").unwrap();
-    write!(url, "http://uk2.internet-radio.com:8171/stream").unwrap();
+    write!(url, "http://orf-live.ors-shoutcast.at/fm4-q2a").unwrap();
+    // write!(url, "http://uk2.internet-radio.com:8171/stream").unwrap();
 
     let mut tls_read_buffer = [0; 4096];
     let mut tls_write_buffer = [0; 4096];
-    let mut rx_buffer = [0; 2048];
+    let mut rx_buffer = [0; 4096];
 
-    let client_state = TcpClientState::<1, 1024, 1024>::new();
+    let layout = Layout::array::<u8>(STREAM_BUFFER_SIZE).unwrap();
+    let data_buffer_ptr = unsafe { ALLOCATOR.alloc(layout) };
+    let data_buffer = unsafe { core::slice::from_raw_parts_mut(data_buffer_ptr, layout.size()) };
+
+    let client_state = TcpClientState::<1, 4096, 4096>::new();
     let tcp_client = TcpClient::new(&stack, &client_state);
     let dns = DnsSocket::new(&stack);
 
@@ -149,8 +190,10 @@ pub async fn test_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice
         if icy_metaint == 0 {
             println!("No icy stream");
         } else {
+            let mut decoder = RawDecoder::new();
+            let mut sample_buf = [Sample::default(); MAX_SAMPLES_PER_FRAME];
             let mut body_reader = response.body().reader();
-            let mut data_buffer = [0u8; 8192];
+            // let mut data_buffer = [0u8; STREAM_BUFFER_SIZE];
             let mut data_buffer_index = 0;
             let mut global_index = 0;
             let mut in_meta = false;
@@ -186,7 +229,16 @@ pub async fn test_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice
                                 current_meta.push(*b);
                                 in_meta_data_index = in_meta_data_index + 1;
                                 if in_meta_data_index == meta_data_len {
-                                    println!("{}", unsafe { from_utf8_unchecked(current_meta.as_slice()) });
+                                    let meta_data_str = unsafe {
+                                        if current_meta.len() > META_DATA_TITLE_LEN_MAX {
+                                            from_utf8_unchecked(&current_meta.as_slice()[..META_DATA_TITLE_LEN_MAX])
+                                        } else { from_utf8_unchecked(&current_meta.as_slice()) }
+                                    };
+                                    let meta_data = MetaData {
+                                        title: String::from(meta_data_str)
+                                    };
+                                    META_DATA_SIGNAL.signal(meta_data);
+                                    // println!("{}", meta_data_str);
                                     in_meta = false;
                                     global_index = 0;
                                 }
@@ -194,12 +246,34 @@ pub async fn test_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice
                             } else {
                                 data_buffer[data_buffer_index] = *b;
                                 data_buffer_index = data_buffer_index + 1;
-                                if data_buffer_index == 8192 {
-                                    // println!("{}", time.elapsed().as_micros());
-                                    println!("send buffer");
-                                    STREAM_CHANNEL.send(data_buffer.clone()).await;
-                                    time = Instant::now();
-                                    data_buffer_index = 0;
+                                if data_buffer_index == STREAM_BUFFER_SIZE {
+                                    let mut consumed = 0;
+
+                                    while let Some((frame, bytes_consumed)) = decoder.next(&data_buffer[consumed..], &mut sample_buf) {
+                                        consumed += bytes_consumed;
+                                        if let Frame::Audio(audio) = frame {
+                                            // let mut sample_buf_copy = [Sample::default(); MAX_SAMPLES_PER_FRAME];
+                                            // sample_buf_copy.copy_from_slice(audio.samples());
+                                            // let data =
+                                            //     unsafe { core::slice::from_raw_parts(audio.samples() as *const _ as *const u8, audio.samples().len() * 2) };
+                                            // let mut sample_buf_u8 = [0u8; MAX_SAMPLES_PER_FRAME_BYTE];
+                                            // sample_buf_u8.copy_from_slice(data);
+                                            // let mut sample_count = 0;
+                                            // for i in 0..data.len() {
+                                            //     sample_buf_u8[i] = data[i];
+                                            //     sample_count += 1;
+                                            // }
+                                            // println!("{} {} {}", sample_buf[0], sample_buf[1], sample_buf[2]);
+                                            FRAME_CHANNEL.send(sample_buf).await;
+                                            break;
+                                        }
+                                    }
+                                    data_buffer_index -= consumed;
+                                    {
+                                        for i in 0..data_buffer_index {
+                                            data_buffer[i] = data_buffer[i + consumed];
+                                        }
+                                    }
                                 }
                                 global_index = global_index + 1;
                             }
@@ -217,6 +291,18 @@ pub async fn test_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice
         }
     }
 }
+
+fn display_text<D, S>(display: &mut D, pos: Point, character_style: S,
+                      text_style: TextStyle, text: &str) where D: DrawTarget<Color=Rgb565>, S: TextRenderer<Color=Rgb565> {
+    let _ = Text::with_text_style(
+        text,
+        pos,
+        character_style,
+        text_style,
+    )
+        .draw(display);
+}
+
 
 #[main]
 async fn main(spawner: Spawner) {
@@ -295,10 +381,11 @@ async fn main(spawner: Spawner) {
     let dc = io.pins.gpio33.into_push_pull_output();
 
     let display_cs = io.pins.gpio15.into_push_pull_output();
+    let sd_cs = io.pins.gpio14.into_push_pull_output();
 
     let mut rst = DummyPin;
 
-    let spi2 = Spi::new(peripherals.SPI2, 26u32.MHz(), SpiMode::Mode0, clocks)
+    let spi2 = Spi::new(peripherals.SPI2, 20u32.MHz(), SpiMode::Mode0, clocks)
         .with_pins(Some(sclk), Some(mosi), Some(miso), NO_PIN);
 
     let spi2_bus = blocking_mutex::Mutex::<blocking_mutex::raw::CriticalSectionRawMutex, _>::new(RefCell::new(spi2));
@@ -306,6 +393,9 @@ async fn main(spawner: Spawner) {
     let display_spi = blocking::spi::SpiDevice::new(
         &spi2_bus,
         display_cs);
+    let sd_spi = blocking::spi::SpiDevice::new(
+        &spi2_bus,
+        DummyPin);
 
     let spi_iface = SPIInterfaceNoCS::new(display_spi, dc);
 
@@ -322,9 +412,27 @@ async fn main(spawner: Spawner) {
         display_size,
     ).unwrap();
 
+    let mut character_styles = CharacterStyles::new();
+
     let background_color_default = Rgb565::BLACK;
+    character_styles.set_background_color(background_color_default);
 
     display.clear_screen(background_color_default).unwrap();
+
+    let sdcard = embedded_sdmmc::sdcard::SdCard::new(sd_spi, sd_cs, Delay);
+    let mut sdcard_manager = SdcardManager::new(sdcard);
+
+    let mut root_file_list = Vec::new();
+    if let Ok(()) = sdcard_manager.open_root_dir() {
+        match sdcard_manager.get_root_dir_entries(&mut root_file_list) {
+            Ok(()) => {}
+            Err(e) => println!("{:?}", e)
+        }
+        // if sdcard_manager.get_root_dir_entries(&mut root_file_list).is_err() {
+        //     root_file_list.clear();
+        // }
+    }
+    println!("root dir files size = {}", root_file_list.len());
 
 
     let wifi = peripherals.WIFI;
@@ -363,26 +471,102 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(500)).await;
     }
 
-    spawner.must_spawn(test_stream(stack));
+    spawner.must_spawn(handle_radio_stream(stack));
 
-    let mut decoder = RawDecoder::new();
-    let mut buf = [Sample::default(); MAX_SAMPLES_PER_FRAME];
+    let mut str_buf: String<128> = String::new();
 
+    let dma = Dma::new(system.dma);
+    let dma_channel = dma.i2s0channel;
+
+    let (tx_buffer, mut tx_descriptors, _, mut rx_descriptors) = dma_buffers!(8192, 0);
+
+    // let layout = Layout::array::<u8>(FRAME_BUFFER_SIZE).unwrap();
+    // let frame_buffer_ptr = unsafe { ALLOCATOR.alloc(layout) };
+    // let frame_buffer = unsafe { core::slice::from_raw_parts_mut(frame_buffer_ptr, layout.size()) };
+
+    let i2s = I2s::new(
+        peripherals.I2S0,
+        Standard::Philips,
+        DataFormat::Data16Channel16,
+        44100u32.Hz(),
+        2,
+        dma_channel.configure(
+            false,
+            &mut tx_descriptors,
+            &mut rx_descriptors,
+            DmaPriority::Priority0,
+        ),
+        &clocks,
+    );
+
+    let i2s_tx = i2s
+        .i2s_tx
+        .with_bclk(io.pins.gpio26)
+        .with_ws(io.pins.gpio25)
+        .with_dout(io.pins.gpio12)
+        .build();
+
+    let mut transaction = i2s_tx.write_dma_circular_async(tx_buffer).unwrap();
+
+    let mut i2s_buffer_index = 0;
+    let mut i2s_buffer_written = 0;
+    let time = Instant::now();
+    let mut last_dt = 0;
+    let mut frame_buffer_index = 0;
+
+    let file = sdcard_manager.open_file_in_root_dir_for_writing("B.WAV").unwrap();
+
+    let mut file_written = 0;
+    let mut file_done = false;
     loop {
-        let stream_data: [u8; 8192] = STREAM_CHANNEL.receive().await;
-        let mut time = Instant::now();
-        println!("receive buffer");
-        let mut index = 0;
-
-        while let Some((frame, bytes_consumed)) = decoder.next(&stream_data[index..], &mut buf) {
-            if let Frame::Audio(audio) = frame {
-                // process audio frame here!
-                // println!("audio frame = {} {} {} {} {}", audio.bitrate(), audio.channels(), audio.mpeg_layer(), audio.sample_rate(), buf[0]);
-                // println!("audio frame = {} {} {} {} {} {} {} {}", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
-                // println!("{}", audio.samples().len());
+        if META_DATA_SIGNAL.signaled() {
+            let meta_data = META_DATA_SIGNAL.wait().await;
+            let title = meta_data.title.as_str();
+            if title.contains("StreamTitle=") {
+                let title_value = title.split_at("StreamTitle=".len()).1;
+                display_text(&mut display, Point::new(0, 0), character_styles.default_character_style(),
+                             character_styles.default_text_style(), title_value);
             }
-            index = index + bytes_consumed;
         }
-        println!("ellapsed = {}", time.elapsed().as_millis());
+        let frame_data = FRAME_CHANNEL.receive().await;
+        let frame_data_u8 =
+            unsafe { core::slice::from_raw_parts(&frame_data as *const _ as *const u8, frame_data.len() * 2) };
+        // frame_buffer[frame_buffer_index..(frame_buffer_index + MAX_SAMPLES_PER_FRAME_BYTE).min(FRAME_BUFFER_SIZE)].copy_from_slice(frame_data_u8);
+        // frame_buffer_index += MAX_SAMPLES_PER_FRAME_BYTE;
+        // if frame_buffer_index >= FRAME_BUFFER_SIZE {
+        if !file_done {
+            if file_written < 2000 {
+                sdcard_manager.write_file_in_root_dir_from_buffer(file, frame_data_u8).unwrap();
+                file_written += 1;
+                // println!("wrote file part {}", file_written);
+                // while i2s_buffer_index < FRAME_BUFFER_SIZE {
+                //     match transaction.push(frame_data_u8).await {
+                //         Ok(written) => {
+                //             // println!("transaction.push written {}", written);
+                //             // i2s_buffer_index += written;
+                //             // i2s_buffer_written += written;
+                //         }
+                //         Err(e) => { println!("transaction.push error ={:?}", e) }
+                //     }
+                // }
+            } else {
+                sdcard_manager.close_file(file).unwrap();
+                println!("close file");
+                sdcard_manager.close_root_dir().unwrap();
+                println!("close dir");
+                file_done = true;
+            }
+        }
+        // frame_buffer_index = 0;
+        // }
+
+        // i2s_buffer_index = 0;
+        // let ms = time.elapsed().as_millis();
+        // let s = (ms - last_dt);
+        // if s >= 1000 {
+        //     // println!("Length: {} : {}", s / 1000, i2s_buffer_written);
+        //     last_dt = ms;
+        //     i2s_buffer_written = 0;
+        // }
     }
 }
