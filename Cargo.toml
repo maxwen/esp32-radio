@@ -32,9 +32,15 @@ embedded-hal-bus = { version = "0.1.0", features = ["async"] }
 embedded-hal-async = "1.0.0"
 embedded-sdmmc = { version = "0.7.0" }
 reqwless = { version = "0.11.0", features = ["alloc"] }
-rmp3 = {  version = "0.3", default-features = false }
+rmp3 = {  version = "0.3", default-features = false, features = ["simd"] }
 profont = "0.7.0"
 eg-seven-segment = "0.2.0"
+
+[dev-dependencies]
+futures-executor = { version = "0.3.17", features = [ "thread-pool" ] }
+futures-test = "0.3.17"
+futures-timer = "3.0.2"
+futures-util = { version = "0.3.17", features = [ "channel" ] }
 
 [profile.dev]
 opt-level = 3
