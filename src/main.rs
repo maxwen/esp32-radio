@@ -4,7 +4,6 @@
 
 extern crate alloc;
 
-use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
@@ -14,13 +13,14 @@ use core::str::from_utf8_unchecked;
 
 use display_interface_spi::SPIInterfaceNoCS;
 use embassy_embedded_hal::SetConfig;
-use embassy_embedded_hal::shared_bus::{asynch, blocking};
+use embassy_embedded_hal::shared_bus::blocking;
 use embassy_executor::Spawner;
 use embassy_net::{Config, Stack, StackResources};
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_sync::{blocking_mutex, mutex};
+use embassy_sync::blocking_mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_graphics::draw_target::DrawTarget;
@@ -29,22 +29,27 @@ use embedded_graphics::geometry::Point;
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::text::{Text, TextStyle};
 use embedded_graphics::text::renderer::TextRenderer;
+use embedded_hal_async::digital::Wait;
 use embedded_hal_async::i2c::I2c;
 use embedded_svc::io::asynch::BufRead;
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp32_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
 use esp32_hal::{Rng, timer::TimerGroup};
 use esp32_hal::clock::Clocks;
-use esp32_hal::dma::DmaPriority;
+use esp32_hal::dma::{DmaDescriptor, DmaPriority};
 use esp32_hal::gpio::{GpioPin, NO_PIN, Unknown};
 use esp32_hal::i2c::I2C;
-use esp32_hal::i2s::{DataFormat, I2s, I2sWriteDma, Standard};
+use esp32_hal::i2s::{DataFormat, I2s, Standard};
 use esp32_hal::i2s::asynch::I2sWriteDmaAsync;
 use esp32_hal::ledc::{channel, HighSpeed, LEDC, timer};
 use esp32_hal::pdma::{Dma, I2s0DmaChannel};
-use esp32_hal::peripherals::I2S0;
+use esp32_hal::peripherals::{I2C0, I2S0};
 use esp32_hal::spi::master::{Instance, Spi};
 use esp32_hal::spi::SpiMode;
+use esp32_utils_crate::dummy_pin::DummyPin;
+use esp32_utils_crate::fonts::CharacterStyles;
+use esp32_utils_crate::sdcard::SdcardManager;
+use esp32_utils_crate::touch_mapper::TouchPosMapper;
 use esp_backtrace;
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize};
@@ -57,17 +62,12 @@ use reqwless::request::Method::GET;
 use reqwless::response::Status;
 use rmp3::{MAX_SAMPLES_PER_FRAME, RawDecoder};
 use rmp3::Frame;
-use rust_utils::dummy_pin::DummyPin;
 use static_cell::make_static;
 use static_cell::StaticCell;
 
-use crate::fonts::CharacterStyles;
-use crate::my_channel::MyChannel;
-use crate::sdcard::SdcardManager;
+use crate::tsc2007::{Tsc2007, TSC2007_ADDR};
 
-mod fonts;
-mod sdcard;
-mod my_channel;
+mod tsc2007;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
@@ -84,24 +84,39 @@ const PASSWORD: &str = env!("PASSWORD");
 // in psram
 const STREAM_BUFFER_SIZE: usize = 1024 * 16;
 
-// static STREAM_CHANNEL: Channel<CriticalSectionRawMutex, [u8; STREAM_BUFFER_SIZE], 4> = Channel::new();
-
-
 const MAX_SAMPLES_PER_FRAME_BYTE: usize = MAX_SAMPLES_PER_FRAME * 2;
 
-// in psram
-// const FRAME_BUFFER_SIZE: usize = MAX_SAMPLES_PER_FRAME_BYTE * 16;
-// const I2S_BUFFER_SIZE: usize = 8192;
+const I2S_BUFFER_SIZE: usize = 32000;
 
 const META_DATA_TITLE_LEN_MAX: usize = 256;
 
+#[derive(Debug, Clone)]
 struct MetaData {
     title: String<META_DATA_TITLE_LEN_MAX>,
+    channels: u16,
+    sample_rate: u32,
+    bitrate: u32,
+}
+
+impl MetaData {
+    fn is_incomplete(&self) -> bool {
+        self.channels == 0 || self.sample_rate == 0 || self.bitrate == 0
+    }
 }
 
 static META_DATA_SIGNAL: Signal<CriticalSectionRawMutex, MetaData> = Signal::new();
 
-const MAX_SAMPLE_PER_FRAME_DATA: usize = 2;
+const RADIO_STATION_URL_LEN_MAX: usize = 256;
+
+#[derive(Clone)]
+struct ControlData {
+    url: String<RADIO_STATION_URL_LEN_MAX>,
+    stop: bool,
+}
+
+static CONTROL_DATA_SIGNAL: Signal<CriticalSectionRawMutex, ControlData> = Signal::new();
+
+const MAX_SAMPLE_PER_FRAME_DATA: usize = 1;
 
 #[derive(Clone, Copy)]
 struct FrameData {
@@ -109,7 +124,7 @@ struct FrameData {
     data: [[i16; MAX_SAMPLES_PER_FRAME]; MAX_SAMPLE_PER_FRAME_DATA],
 }
 
-static FRAME_CHANNEL: MyChannel<CriticalSectionRawMutex, FrameData, 2> = MyChannel::new();
+static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 2> = Channel::new();
 
 macro_rules! singleton {
     ($val:expr, $typ:ty) => {{
@@ -158,9 +173,11 @@ async fn connection(mut controller: WifiController<'static>) {
 
 #[embassy_executor::task]
 pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
-    let mut url: String<1024> = String::new();
-    write!(url, "http://orf-live.ors-shoutcast.at/fm4-q2a").unwrap();
-    // write!(url, "http://uk2.internet-radio.com:8171/stream").unwrap();
+    let mut url_list: heapless::Vec<String<1024>, 3> = heapless::Vec::new();
+    url_list.push(String::from("http://orf-live.ors-shoutcast.at/fm4-q2a")).unwrap();
+    url_list.push(String::from("http://cheetah.streemlion.com:2160/stream")).unwrap();
+    url_list.push(String::from("http://uk2.internet-radio.com:8171/stream")).unwrap();
+    let mut url_index = 0;
 
     let mut tls_read_buffer = [0; 4096];
     let mut tls_write_buffer = [0; 4096];
@@ -177,121 +194,152 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
     let tls_config = TlsConfig::new(123456789u64, &mut tls_read_buffer, &mut tls_write_buffer, TlsVerify::None);
     let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns, tls_config);
 
-    let mut request = http_client.request(GET, url.as_str()).await.unwrap();
-    // request = request.content_type(ContentType::ApplicationOctetStream);
-    let headers = [("Icy-MetaData", "1")];
-    request = request.headers(&headers);
+    loop {
+        println!("connecting to {}", url_list[url_index]);
+        let mut request = http_client.request(GET, url_list[url_index].as_str()).await.unwrap();
+        let headers = [("Icy-MetaData", "1")];
+        request = request.headers(&headers);
 
-    let mut icy_metaint = 0;
-    let response = request.send(&mut rx_buffer).await.unwrap();
-    if response.status == Status::Ok {
-        for i in response.headers() {
-            let key = i.0;
-            if key.starts_with("icy") {
-                println!("{}:{:?}", i.0, unsafe { from_utf8_unchecked(i.1) });
-                if key.eq_ignore_ascii_case("icy-metaint") {
-                    let icy_metaint_str = unsafe { from_utf8_unchecked(i.1) };
-                    icy_metaint = icy_metaint_str.parse().unwrap();
-                    println!("icy_metaint = {}", icy_metaint);
+        let mut icy_metaint = 0;
+        let response = request.send(&mut rx_buffer).await.unwrap();
+        if response.status == Status::Ok {
+            for i in response.headers() {
+                let key = i.0;
+                if key.starts_with("icy") {
+                    println!("{}:{:?}", i.0, unsafe { from_utf8_unchecked(i.1) });
+                    if key.eq_ignore_ascii_case("icy-metaint") {
+                        let icy_metaint_str = unsafe { from_utf8_unchecked(i.1) };
+                        icy_metaint = icy_metaint_str.parse().unwrap();
+                        println!("icy_metaint = {}", icy_metaint);
+                    }
                 }
             }
-        }
 
-        if icy_metaint == 0 {
-            println!("No icy stream");
-        } else {
-            let mut decoder = RawDecoder::new();
-            let mut body_reader = response.body().reader();
-            let mut data_buffer_index = 0;
-            let mut global_index = 0;
-            let mut in_meta = false;
-            let mut in_meta_data_index = 0;
-            let mut meta_data_len = 0;
-            let mut current_meta: Vec<u8> = vec![];
-            let mut frame_id = 0;
-            let mut frame_index = 0;
-            let mut frame_data = FrameData {
-                id: 0,
-                data: [[0; MAX_SAMPLES_PER_FRAME]; MAX_SAMPLE_PER_FRAME_DATA],
-            };
+            if icy_metaint == 0 {
+                println!("no icy stream");
+                url_index = (url_index + 1) % url_list.len();
+                println!("url = {}", url_list[url_index]);
+                return;
+            } else {
+                let mut decoder = RawDecoder::new();
+                let mut body_reader = response.body().reader();
+                let mut data_buffer_index = 0;
+                let mut global_index = 0;
+                let mut in_meta = false;
+                let mut in_meta_data_index = 0;
+                let mut meta_data_len = 0;
+                let mut current_meta: Vec<u8> = vec![];
+                let mut frame_id = 0;
+                let mut frame_index = 0;
+                let mut meta_data = MetaData {
+                    title: String::from(""),
+                    bitrate: 0,
+                    channels: 0,
+                    sample_rate: 0,
+                };
+                let mut frame_data = FrameData {
+                    id: 0,
+                    data: [[0; MAX_SAMPLES_PER_FRAME]; MAX_SAMPLE_PER_FRAME_DATA],
+                };
 
-            loop {
-                match (body_reader.fill_buf().await) {
-                    Ok(mut buf) => {
-                        if buf.is_empty() {
+                loop {
+                    if CONTROL_DATA_SIGNAL.signaled() {
+                        let control_data = CONTROL_DATA_SIGNAL.wait().await;
+                        if control_data.stop {
+                            url_index = (url_index + 1) % url_list.len();
+                            println!("url = {}", url_list[url_index]);
+                            // frame_data.id = 0;
+                            // FRAME_CHANNEL.send(frame_data).await;
                             break;
                         }
-                        let buf_len = buf.len();
-                        let mut buf_iter = buf.iter();
-                        while let Some(b) = buf_iter.next() {
-                            if !in_meta && global_index == icy_metaint {
-                                meta_data_len = (*b as u16 * 16) as usize;
-                                // println!("meta_data_len should be {}", meta_data_len);
-                                if meta_data_len != 0 {
-                                    in_meta = true;
-                                    current_meta.clear();
-                                    in_meta_data_index = 0;
-                                } else {
-                                    global_index = 0;
-                                }
-                                continue;
-                            }
-                            if in_meta {
-                                current_meta.push(*b);
-                                in_meta_data_index = in_meta_data_index + 1;
-                                if in_meta_data_index == meta_data_len {
-                                    let meta_data_str = unsafe {
-                                        if current_meta.len() > META_DATA_TITLE_LEN_MAX {
-                                            from_utf8_unchecked(&current_meta.as_slice()[..META_DATA_TITLE_LEN_MAX])
-                                        } else { from_utf8_unchecked(&current_meta.as_slice()) }
-                                    };
-                                    let meta_data = MetaData {
-                                        title: String::from(meta_data_str)
-                                    };
-                                    META_DATA_SIGNAL.signal(meta_data);
-                                    // println!("{}", meta_data_str);
-                                    in_meta = false;
-                                    global_index = 0;
-                                }
-                                continue;
-                            } else {
-                                data_buffer[data_buffer_index] = *b;
-                                data_buffer_index = data_buffer_index + 1;
-                                if data_buffer_index == STREAM_BUFFER_SIZE {
-                                    let mut consumed = 0;
-
-                                    while let Some((frame, bytes_consumed)) = decoder.next(&data_buffer[consumed..], &mut frame_data.data[frame_index]) {
-                                        consumed += bytes_consumed;
-                                        if let Frame::Audio(audio) = frame {
-                                            frame_index += 1;
-                                            if frame_index == MAX_SAMPLE_PER_FRAME_DATA {
-                                                // println!("frame send {} {}", frame_id, FRAME_CHANNEL.free());
-                                                frame_data.id = frame_id;
-                                                FRAME_CHANNEL.send(frame_data).await;
-                                                frame_id += 1;
-                                                frame_index = 0;
-                                            }
-                                            break;
-                                        }
-                                    }
-
-                                    data_buffer_index -= consumed;
-                                    {
-                                        for i in 0..data_buffer_index {
-                                            data_buffer[i] = data_buffer[i + consumed];
-                                        }
-                                    }
-                                }
-                                global_index = global_index + 1;
-                            }
-                        }
-                        // println!("{}", time.elapsed().as_millis());
-
-                        body_reader.consume(buf_len);
                     }
-                    Err(e) => {
-                        println!("{:?}", e);
-                        break;
+
+                    match (body_reader.fill_buf().await) {
+                        Ok(mut buf) => {
+                            if buf.is_empty() {
+                                println!("lost connection");
+                                url_index = (url_index + 1) % url_list.len();
+                                println!("url = {}", url_list[url_index]);
+                                break;
+                            }
+                            let buf_len = buf.len();
+                            let mut buf_iter = buf.iter();
+                            while let Some(b) = buf_iter.next() {
+                                if !in_meta && global_index == icy_metaint {
+                                    meta_data_len = (*b as u16 * 16) as usize;
+                                    // println!("meta_data_len should be {}", meta_data_len);
+                                    if meta_data_len != 0 {
+                                        in_meta = true;
+                                        current_meta.clear();
+                                        in_meta_data_index = 0;
+                                    } else {
+                                        global_index = 0;
+                                    }
+                                    continue;
+                                }
+                                if in_meta {
+                                    if *b != b'\0' {
+                                        current_meta.push(*b);
+                                    }
+                                    in_meta_data_index = in_meta_data_index + 1;
+                                    if in_meta_data_index == meta_data_len {
+                                        let meta_data_str = unsafe {
+                                            if current_meta.len() > META_DATA_TITLE_LEN_MAX {
+                                                from_utf8_unchecked(&current_meta.as_slice()[..META_DATA_TITLE_LEN_MAX])
+                                            } else { from_utf8_unchecked(&current_meta.as_slice()) }
+                                        };
+
+                                        meta_data.title = String::from(meta_data_str);
+                                        META_DATA_SIGNAL.signal(meta_data.clone());
+                                        // println!("{}", meta_data_str);
+                                        in_meta = false;
+                                        global_index = 0;
+                                    }
+                                    continue;
+                                } else {
+                                    data_buffer[data_buffer_index] = *b;
+                                    data_buffer_index = data_buffer_index + 1;
+                                    if data_buffer_index == STREAM_BUFFER_SIZE {
+                                        let mut consumed = 0;
+                                        while let Some((frame, bytes_consumed)) = decoder.next(&data_buffer[consumed..], &mut frame_data.data[frame_index]) {
+                                            consumed += bytes_consumed;
+                                            if let Frame::Audio(audio) = frame {
+                                                if meta_data.is_incomplete() {
+                                                    meta_data.channels = audio.channels();
+                                                    meta_data.sample_rate = audio.sample_rate();
+                                                    meta_data.bitrate = audio.bitrate();
+                                                    META_DATA_SIGNAL.signal(meta_data.clone());
+                                                }
+
+                                                frame_index += 1;
+                                                if frame_index == MAX_SAMPLE_PER_FRAME_DATA {
+                                                    frame_data.id = frame_id;
+                                                    FRAME_CHANNEL.send(frame_data).await;
+                                                    frame_id += 1;
+                                                    frame_index = 0;
+                                                }
+                                                break;
+                                            }
+                                        }
+
+                                        data_buffer_index -= consumed;
+                                        {
+                                            for i in 0..data_buffer_index {
+                                                data_buffer[i] = data_buffer[i + consumed];
+                                            }
+                                        }
+                                    }
+                                    global_index = global_index + 1;
+                                }
+                            }
+                            // println!("{}", time.elapsed().as_millis());
+
+                            body_reader.consume(buf_len);
+                        }
+                        Err(e) => {
+                            println!("{:?}", e);
+                            break;
+                        }
                     }
                 }
             }
@@ -309,26 +357,31 @@ pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel>, bclk_p
         .with_dout(dout_pin)
         .build();
 
-    static mut BUFFER: [u8; 4092 * 4] = [0u8; 4092 * 4];
-    let buffer: &'static mut [u8; 4092 * 4] = unsafe { &mut BUFFER };
-    let mut transaction = i2s_tx.write_dma_circular_async(buffer).unwrap();
-    let mut bytes = 0;
+    let tx_buffer = make_static!([0u8; I2S_BUFFER_SIZE]);
+
+    let mut transaction = i2s_tx.write_dma_circular_async(tx_buffer).unwrap();
+    let mut total_bytes: u64 = 0;
+    // let time = Instant::now();
+
     loop {
         let frame_data = FRAME_CHANNEL.receive().await;
-        // println!("frame receive {} {}", frame_data.id, FRAME_CHANNEL.free());
+        // if frame_data.id == 0 {
+        //     println!("silence frame received");
+        //     continue;
+        // }
         let mut frame_index = 0;
 
         while frame_index < MAX_SAMPLE_PER_FRAME_DATA {
             let frame_data_part = frame_data.data[frame_index];
             let frame_data_part_u8 =
                 unsafe { core::slice::from_raw_parts(&frame_data_part as *const _ as *const u8, frame_data_part.len() * 2) };
-            bytes += frame_data_part_u8.len();
             let mut written_bytes = 0;
             while written_bytes != frame_data_part_u8.len() {
                 match transaction.push(&frame_data_part_u8[written_bytes..]).await {
                     Ok(written) => {
                         // println!("transaction.push written {}", written);
                         written_bytes += written;
+                        total_bytes += written_bytes as u64;
                         // i2s_buffer_index += written;
                         // i2s_buffer_written += written;
                     }
@@ -336,6 +389,55 @@ pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel>, bclk_p
                 }
             }
             frame_index += 1;
+        }
+        // let ellapsed_secs = time.elapsed().as_secs();
+        // if ellapsed_secs != 0 {
+        //     println!("{}", total_bytes / ellapsed_secs);
+        // }
+    }
+}
+
+#[embassy_executor::task]
+async fn handle_tp_touch_tsc2007(i2c: blocking::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0>>, tp_irq_pin: GpioPin<Unknown, 32>,
+                                 orientation: Orientation, width: u16, height: u16) {
+    let mut tsc2007 = Tsc2007::new(i2c);
+
+    let mut handle_touch: bool = false;
+    let mut tp_irq_input = tp_irq_pin.into_pull_down_input();
+
+    let pos_mapper = TouchPosMapper::new(240, 320, (tsc2007::TS_MINX, tsc2007::TS_MAXX), (tsc2007::TS_MINY, tsc2007::TS_MAXY));
+
+    loop {
+        tp_irq_input.wait_for_low().await.unwrap();
+        if let Ok(point) = tsc2007.touch() {
+            let x = point.0;
+            let y = point.1;
+            let z = point.2;
+            if z > tsc2007::TS_MIN_PRESSURE {
+                if !handle_touch {
+                    handle_touch = true;
+                    // println!("{:?}", point);
+
+                    let (x_scaled, y_scaled) = match orientation {
+                        Orientation::Portrait => pos_mapper.map_touch_pos(x, y, width, height, 0),
+                        Orientation::Landscape => pos_mapper.map_touch_pos(x, y, width, height, 1),
+                        Orientation::PortraitFlipped => pos_mapper.map_touch_pos(x, y, width, height, 2),
+                        Orientation::LandscapeFlipped => pos_mapper.map_touch_pos(x, y, width, height, 3),
+                    };
+
+                    CONTROL_DATA_SIGNAL.signal(ControlData {
+                        url: String::from(""),
+                        stop: true,
+                    })
+                    // CHANNEL.send(ChannelData {
+                    //     code: 4,
+                    //     touch_event: [x_scaled, y_scaled, point.2],
+                    //     ..Default::default()
+                    // }).await;
+                }
+            } else {
+                handle_touch = false;
+            }
         }
     }
 }
@@ -417,11 +519,11 @@ async fn main(spawner: Spawner) {
         clocks,
     );
 
-    let i2c0_bus = mutex::Mutex::<blocking_mutex::raw::CriticalSectionRawMutex, _>::new(i2c0);
+    let i2c0_bus = blocking_mutex::Mutex::<blocking_mutex::raw::CriticalSectionRawMutex, _>::new(RefCell::new(i2c0));
     let i2c0_bus_static = make_static!(i2c0_bus);
 
-    let mut i2c0_dev1 = asynch::i2c::I2cDevice::new(i2c0_bus_static);
-    let mut i2c0_dev2 = asynch::i2c::I2cDevice::new(i2c0_bus_static);
+    let mut i2c0_dev1 = blocking::i2c::I2cDevice::new(i2c0_bus_static);
+    let has_tsc2007 = embedded_hal::i2c::I2c::read(&mut i2c0_dev1, TSC2007_ADDR, &mut [0]).is_ok();
 
     let sclk = io.pins.gpio5;
     let miso = io.pins.gpio21;
@@ -467,20 +569,20 @@ async fn main(spawner: Spawner) {
 
     display.clear_screen(background_color_default).unwrap();
 
-    let sdcard = embedded_sdmmc::sdcard::SdCard::new(sd_spi, sd_cs, Delay);
-    let mut sdcard_manager = SdcardManager::new(sdcard);
-
-    let mut root_file_list = Vec::new();
-    if let Ok(()) = sdcard_manager.open_root_dir() {
-        match sdcard_manager.get_root_dir_entries(&mut root_file_list) {
-            Ok(()) => {}
-            Err(e) => println!("{:?}", e)
-        }
-        // if sdcard_manager.get_root_dir_entries(&mut root_file_list).is_err() {
-        //     root_file_list.clear();
-        // }
-    }
-    println!("root dir files size = {}", root_file_list.len());
+    // let sdcard = embedded_sdmmc::sdcard::SdCard::new(sd_spi, sd_cs, Delay);
+    // let mut sdcard_manager = SdcardManager::new(sdcard);
+    //
+    // let mut root_file_list = Vec::new();
+    // if let Ok(()) = sdcard_manager.open_root_dir() {
+    //     match sdcard_manager.get_root_dir_entries(&mut root_file_list) {
+    //         Ok(()) => {}
+    //         Err(e) => println!("{:?}", e)
+    //     }
+    // }
+    // println!("root dir files size = {}", root_file_list.len());
+    // for file in &root_file_list {
+    //     println!("{}", file.name);
+    // }
 
 
     let wifi = peripherals.WIFI;
@@ -522,18 +624,15 @@ async fn main(spawner: Spawner) {
     let dma = Dma::new(system.dma);
     let dma_channel = dma.i2s0channel;
 
-    static mut TX_DESCRIPTORS_BUFFER: [u32; 24] = [0u32; ((32000 + 4091) / 4092) * 3];
-    let tx_descriptors: &'static mut [u32; 24] = unsafe { &mut TX_DESCRIPTORS_BUFFER };
-
-    static mut RX_DESCRIPTORS_BUFFER: [u32; 24] = [0u32; ((32000 + 4091) / 4092) * 3];
-    let rx_descriptors: &'static mut [u32; 24] = unsafe { &mut RX_DESCRIPTORS_BUFFER };
+    // from dma_buffers macro
+    let tx_descriptors = make_static!([DmaDescriptor::EMPTY; (I2S_BUFFER_SIZE + 4091) / 4092]);
+    let rx_descriptors = make_static!([DmaDescriptor::EMPTY; (I2S_BUFFER_SIZE + 4091) / 4092]);
 
     let i2s = I2s::new(
         peripherals.I2S0,
         Standard::Philips,
         DataFormat::Data16Channel16,
         44100u32.Hz(),
-        2,
         dma_channel.configure(
             false,
             tx_descriptors,
@@ -543,49 +642,68 @@ async fn main(spawner: Spawner) {
         clocks,
     );
 
-    let file = sdcard_manager.open_file_in_root_dir_for_writing("B.WAV").unwrap();
-
     spawner.must_spawn(handle_radio_stream(stack));
-    // spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
+    spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
+    if has_tsc2007 {
+        spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display.width() as u16, display.height() as u16));
+    }
 
-    let mut file_written = 0;
-    let mut file_done = false;
-    let mut frame_sample_count = 0;
-    let mut time = Instant::now();
+    // let mut file_written = 0;
+    // let mut file_done = false;
+    // let mut frame_sample_count = 0;
+    // let mut time = Instant::now();
     loop {
         if META_DATA_SIGNAL.signaled() {
             let meta_data = META_DATA_SIGNAL.wait().await;
-            let title = meta_data.title.as_str();
-            if title.contains("StreamTitle=") {
-                let title_value = title.split_at("StreamTitle=".len()).1;
+            display.clear_screen(background_color_default).unwrap();
+
+            let mut buf: String<META_DATA_TITLE_LEN_MAX> = String::new();
+
+            let mut title = meta_data.title.strip_prefix("StreamTitle='").unwrap_or(meta_data.title.as_str());
+            title = title.strip_suffix("';").unwrap_or(meta_data.title.as_str());
+
+            let split_pos = title.find(" - ").unwrap_or(0);
+            if split_pos != 0 {
+                let (artist, track) = title.split_at(split_pos);
                 display_text(&mut display, Point::new(0, 0), character_styles.default_character_style(),
-                             character_styles.default_text_style(), title_value);
+                             character_styles.default_text_style(), artist);
+                display_text(&mut display, Point::new(0, 30), character_styles.default_character_style(),
+                             character_styles.default_text_style(), track.strip_prefix(" - ").unwrap_or(track));
+            } else {
+                display_text(&mut display, Point::new(0, 0), character_styles.default_character_style(),
+                             character_styles.default_text_style(), title);
             }
+
+            buf.clear();
+            write!(buf, "{} / {} / {}", meta_data.sample_rate, meta_data.channels, meta_data.bitrate).unwrap();
+
+            display_text(&mut display, Point::new(0, 60), character_styles.default_character_style(),
+                         character_styles.default_text_style(), buf.as_str());
         }
 
-        let frame_data = FRAME_CHANNEL.receive().await;
-        let mut frame_index = 0;
+        // let frame_data = FRAME_CHANNEL.receive().await;
+        // let mut frame_index = 0;
+        //
+        // while frame_index < MAX_SAMPLE_PER_FRAME_DATA {
+        //     let frame_data_part = frame_data.data[frame_index];
+        //     let frame_data_part_u8 =
+        //         unsafe { core::slice::from_raw_parts(&frame_data_part as *const _ as *const u8, frame_data_part.len() * 2) };
+        //
+        //     // if !file_done {
+        //     //     if file_written < 4000 {
+        //     //         sdcard_manager.write_file_in_root_dir_from_buffer(file, frame_data_part_u8).unwrap();
+        //     //         file_written += 1;
+        //     //     } else {
+        //     //         sdcard_manager.close_file(file).unwrap();
+        //     //         println!("close file");
+        //     //         sdcard_manager.close_root_dir().unwrap();
+        //     //         println!("close dir");
+        //     //         file_done = true;
+        //     //     }
+        //     // }
+        //     frame_index += 1;
+        // }
 
-        while frame_index < MAX_SAMPLE_PER_FRAME_DATA {
-            let frame_data_part = frame_data.data[frame_index];
-            let frame_data_part_u8 =
-                unsafe { core::slice::from_raw_parts(&frame_data_part as *const _ as *const u8, frame_data_part.len() * 2) };
-
-            if !file_done {
-                if file_written < 4000 {
-                    sdcard_manager.write_file_in_root_dir_from_buffer(file, frame_data_part_u8).unwrap();
-                    file_written += 1;
-                } else {
-                    sdcard_manager.close_file(file).unwrap();
-                    println!("close file");
-                    sdcard_manager.close_root_dir().unwrap();
-                    println!("close dir");
-                    file_done = true;
-                }
-            }
-            frame_index += 1;
-        }
-
-        // Timer::after(Duration::from_millis(250)).await
+        Timer::after(Duration::from_millis(500)).await
     }
 }

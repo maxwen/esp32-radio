@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/esp32-audio.iml" filepath="$PROJECT_DIR$/.idea/esp32-audio.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/esp32-radio.iml" filepath="$PROJECT_DIR$/.idea/esp32-radio.iml" />
     </modules>
   </component>
 </project>
