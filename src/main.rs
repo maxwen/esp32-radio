@@ -9,20 +9,21 @@ use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::RefCell;
 use core::fmt::Write;
+use core::ops::Deref;
 use core::str::from_utf8_unchecked;
 
 use display_interface_spi::SPIInterfaceNoCS;
 use embassy_embedded_hal::SetConfig;
-use embassy_embedded_hal::shared_bus::blocking;
+use embassy_embedded_hal::shared_bus::{asynch, blocking};
 use embassy_executor::Spawner;
 use embassy_net::{Config, Stack, StackResources};
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_sync::blocking_mutex;
+use embassy_sync::{blocking_mutex, mutex};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_time::{Delay, Duration, Timer};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::Drawable;
 use embedded_graphics::geometry::Point;
@@ -43,12 +44,12 @@ use esp32_hal::i2s::{DataFormat, I2s, Standard};
 use esp32_hal::i2s::asynch::I2sWriteDmaAsync;
 use esp32_hal::ledc::{channel, HighSpeed, LEDC, timer};
 use esp32_hal::pdma::{Dma, I2s0DmaChannel};
+use esp32_hal::peripheral::Peripheral;
 use esp32_hal::peripherals::{I2C0, I2S0};
 use esp32_hal::spi::master::{Instance, Spi};
 use esp32_hal::spi::SpiMode;
 use esp32_utils_crate::dummy_pin::DummyPin;
 use esp32_utils_crate::fonts::CharacterStyles;
-use esp32_utils_crate::sdcard::SdcardManager;
 use esp32_utils_crate::touch_mapper::TouchPosMapper;
 use esp_backtrace;
 use esp_println::println;
@@ -241,6 +242,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                     id: 0,
                     data: [[0; MAX_SAMPLES_PER_FRAME]; MAX_SAMPLE_PER_FRAME_DATA],
                 };
+                const SILENCE_DELAY_FRAME: u32 = 32;
 
                 loop {
                     if CONTROL_DATA_SIGNAL.signaled() {
@@ -248,8 +250,16 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                         if control_data.stop {
                             url_index = (url_index + 1) % url_list.len();
                             println!("url = {}", url_list[url_index]);
-                            // frame_data.id = 0;
-                            // FRAME_CHANNEL.send(frame_data).await;
+                            for i in 0..MAX_SAMPLE_PER_FRAME_DATA {
+                                for j in 0..MAX_SAMPLES_PER_FRAME {
+                                    frame_data.data[i][j] = 0;
+                                }
+                            }
+                            for x in 0..SILENCE_DELAY_FRAME {
+                                frame_data.id = frame_id;
+                                FRAME_CHANNEL.send(frame_data).await;
+                                frame_id += 1;
+                            }
                             break;
                         }
                     }
@@ -313,8 +323,10 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
 
                                                 frame_index += 1;
                                                 if frame_index == MAX_SAMPLE_PER_FRAME_DATA {
-                                                    frame_data.id = frame_id;
-                                                    FRAME_CHANNEL.send(frame_data).await;
+                                                    if frame_id > SILENCE_DELAY_FRAME {
+                                                        frame_data.id = frame_id;
+                                                        FRAME_CHANNEL.send(frame_data).await;
+                                                    }
                                                     frame_id += 1;
                                                     frame_index = 0;
                                                 }
@@ -398,7 +410,7 @@ pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel>, bclk_p
 }
 
 #[embassy_executor::task]
-async fn handle_tp_touch_tsc2007(i2c: blocking::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0>>, tp_irq_pin: GpioPin<Unknown, 32>,
+async fn handle_tp_touch_tsc2007(i2c: asynch::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0>>, tp_irq_pin: GpioPin<Unknown, 32>,
                                  orientation: Orientation, width: u16, height: u16) {
     let mut tsc2007 = Tsc2007::new(i2c);
 
@@ -409,7 +421,7 @@ async fn handle_tp_touch_tsc2007(i2c: blocking::i2c::I2cDevice<'static, Critical
 
     loop {
         tp_irq_input.wait_for_low().await.unwrap();
-        if let Ok(point) = tsc2007.touch() {
+        if let Ok(point) = tsc2007.touch().await {
             let x = point.0;
             let y = point.1;
             let z = point.2;
@@ -425,6 +437,7 @@ async fn handle_tp_touch_tsc2007(i2c: blocking::i2c::I2cDevice<'static, Critical
                         Orientation::LandscapeFlipped => pos_mapper.map_touch_pos(x, y, width, height, 3),
                     };
 
+                    println!("CONTROL_DATA_SIGNAL.signal");
                     CONTROL_DATA_SIGNAL.signal(ControlData {
                         url: String::from(""),
                         stop: true,
@@ -519,11 +532,11 @@ async fn main(spawner: Spawner) {
         clocks,
     );
 
-    let i2c0_bus = blocking_mutex::Mutex::<blocking_mutex::raw::CriticalSectionRawMutex, _>::new(RefCell::new(i2c0));
+    let i2c0_bus = mutex::Mutex::<blocking_mutex::raw::CriticalSectionRawMutex, _>::new(i2c0);
     let i2c0_bus_static = make_static!(i2c0_bus);
 
-    let mut i2c0_dev1 = blocking::i2c::I2cDevice::new(i2c0_bus_static);
-    let has_tsc2007 = embedded_hal::i2c::I2c::read(&mut i2c0_dev1, TSC2007_ADDR, &mut [0]).is_ok();
+    let mut i2c0_dev1 = asynch::i2c::I2cDevice::new(i2c0_bus_static);
+    let has_tsc2007 = i2c0_dev1.read(TSC2007_ADDR, &mut [0]).await.is_ok();
 
     let sclk = io.pins.gpio5;
     let miso = io.pins.gpio21;
@@ -627,6 +640,7 @@ async fn main(spawner: Spawner) {
     // from dma_buffers macro
     let tx_descriptors = make_static!([DmaDescriptor::EMPTY; (I2S_BUFFER_SIZE + 4091) / 4092]);
     let rx_descriptors = make_static!([DmaDescriptor::EMPTY; (I2S_BUFFER_SIZE + 4091) / 4092]);
+    // let tx_buffer = make_static!([0u8; I2S_BUFFER_SIZE]);
 
     let i2s = I2s::new(
         peripherals.I2S0,
@@ -642,6 +656,15 @@ async fn main(spawner: Spawner) {
         clocks,
     );
 
+    // let mut i2s_tx = i2s
+    //     .i2s_tx
+    //     .with_bclk(io.pins.gpio26)
+    //     .with_ws(io.pins.gpio25)
+    //     .with_dout(io.pins.gpio12)
+    //     .build();
+    //
+    // let mut transaction = i2s_tx.write_dma_circular_async(tx_buffer).unwrap();
+
     spawner.must_spawn(handle_radio_stream(stack));
     spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
     if has_tsc2007 {
@@ -650,8 +673,8 @@ async fn main(spawner: Spawner) {
 
     // let mut file_written = 0;
     // let mut file_done = false;
-    // let mut frame_sample_count = 0;
     // let mut time = Instant::now();
+    let mut current_sample_rate = 44100u32;
     loop {
         if META_DATA_SIGNAL.signaled() {
             let meta_data = META_DATA_SIGNAL.wait().await;
@@ -679,6 +702,16 @@ async fn main(spawner: Spawner) {
 
             display_text(&mut display, Point::new(0, 60), character_styles.default_character_style(),
                          character_styles.default_text_style(), buf.as_str());
+
+            if meta_data.sample_rate != current_sample_rate {
+                println!("change sample rate to {}", meta_data.sample_rate);
+                current_sample_rate = meta_data.sample_rate;
+                esp32_hal::i2s::private::update_config(Standard::Philips,
+                                                       DataFormat::Data16Channel16,
+                                                       meta_data.sample_rate.Hz(),
+                                                       &clocks);
+
+            }
         }
 
         // let frame_data = FRAME_CHANNEL.receive().await;
@@ -704,6 +737,24 @@ async fn main(spawner: Spawner) {
         //     frame_index += 1;
         // }
 
+        // let frame_data = FRAME_CHANNEL.receive().await;
+        // let mut frame_index = 0;
+        //
+        // while frame_index < MAX_SAMPLE_PER_FRAME_DATA {
+        //     let frame_data_part = frame_data.data[frame_index];
+        //     let frame_data_part_u8 =
+        //         unsafe { core::slice::from_raw_parts(&frame_data_part as *const _ as *const u8, frame_data_part.len() * 2) };
+        //     let mut written_bytes = 0;
+        //     while written_bytes != frame_data_part_u8.len() {
+        //         match transaction.push(&frame_data_part_u8[written_bytes..]).await {
+        //             Ok(written) => {
+        //                 written_bytes += written;
+        //             }
+        //             Err(e) => { println!("transaction.push error ={:?}", e) }
+        //         }
+        //     }
+        //     frame_index += 1;
+        // }
         Timer::after(Duration::from_millis(500)).await
     }
 }
