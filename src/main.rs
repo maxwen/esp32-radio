@@ -57,7 +57,7 @@ use esp_wifi::{EspWifiInitFor, initialize};
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 use heapless::String;
 use ili9341::{DisplaySize240x320, Ili9341, Orientation};
-use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
+use reqwless::client::HttpClient;
 use reqwless::request::{RequestBody, RequestBuilder};
 use reqwless::request::Method::GET;
 use reqwless::response::Status;
@@ -86,6 +86,8 @@ const MAX_SAMPLES_PER_FRAME_BYTE: usize = MAX_SAMPLES_PER_FRAME * 2;
 const I2S_BUFFER_SIZE: usize = 32000;
 
 const META_DATA_TITLE_LEN_MAX: usize = 256;
+
+const SILENCE_DELAY_FRAME: u64 = 32;
 
 #[derive(Debug, Clone)]
 struct MetaData {
@@ -124,7 +126,36 @@ struct ControlData {
     change_url: bool,
 }
 
+impl ControlData {
+    fn new(url: &str, change_url: bool, play_pause: bool) -> Self {
+        ControlData {
+            url: String::from(url),
+            change_url,
+            play_pause,
+        }
+    }
+}
+
 static CONTROL_DATA_SIGNAL: Signal<CriticalSectionRawMutex, ControlData> = Signal::new();
+
+#[derive(Clone, Copy)]
+struct TouchData {
+    x: u16,
+    y: u16,
+    z: u16,
+}
+
+impl TouchData {
+    fn new(x: u16, y: u16, z: u16) -> Self {
+        TouchData {
+            x,
+            y,
+            z,
+        }
+    }
+}
+
+static TOUCH_DATA_SIGNAL: Signal<CriticalSectionRawMutex, TouchData> = Signal::new();
 
 #[derive(Clone, Copy)]
 struct FrameData {
@@ -132,7 +163,17 @@ struct FrameData {
     data: [i16; MAX_SAMPLES_PER_FRAME],
 }
 
-static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 3> = Channel::new();
+
+impl FrameData {
+    fn new() -> Self {
+        FrameData {
+            id: 0,
+            data: [0i16; MAX_SAMPLES_PER_FRAME]
+        }
+    }
+}
+
+static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 4> = Channel::new();
 
 macro_rules! singleton {
     ($val:expr, $typ:ty) => {{
@@ -179,16 +220,20 @@ async fn connection(mut controller: WifiController<'static>) {
     }
 }
 
-#[embassy_executor::task]
-pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
-    let mut url_list: heapless::Vec<String<1024>, 3> = heapless::Vec::new();
-    url_list.push(String::from("http://orf-live.ors-shoutcast.at/fm4-q2a")).unwrap();
-    url_list.push(String::from("http://cheetah.streemlion.com:2160/stream")).unwrap();
-    url_list.push(String::from("http://s16.myradiostream.com:7304")).unwrap();
-    let mut url_index = 0;
+async fn send_silence() {
+    let empty_frame_data = FrameData::new();
+    for x in 0..SILENCE_DELAY_FRAME {
+        FRAME_CHANNEL.send(empty_frame_data).await;
+    }
+}
 
-    let mut tls_read_buffer = [0; 4096];
-    let mut tls_write_buffer = [0; 4096];
+#[embassy_executor::task]
+pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>, default_url: &'static str) {
+    let mut current_url: String<RADIO_STATION_URL_LEN_MAX> = String::from(default_url);
+    let mut playback_paused = false;
+
+    // let mut tls_read_buffer = [0; 4096];
+    // let mut tls_write_buffer = [0; 4096];
     let mut rx_buffer = [0; 4096];
 
     let layout = Layout::array::<u8>(STREAM_BUFFER_SIZE).unwrap();
@@ -199,12 +244,25 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
     let tcp_client = TcpClient::new(&stack, &client_state);
     let dns = DnsSocket::new(&stack);
 
-    let tls_config = TlsConfig::new(123456789u64, &mut tls_read_buffer, &mut tls_write_buffer, TlsVerify::None);
-    let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns, tls_config);
+    // let tls_config = TlsConfig::new(123456789u64, &mut tls_read_buffer, &mut tls_write_buffer, TlsVerify::None);
+    let mut http_client = HttpClient::new(&tcp_client, &dns);
 
     loop {
-        println!("connecting to {}", url_list[url_index]);
-        let mut request = http_client.request(GET, url_list[url_index].as_str()).await.unwrap();
+        if playback_paused {
+            println!("playback paused");
+            let control_data = CONTROL_DATA_SIGNAL.wait().await;
+            if control_data.change_url {
+                current_url.clear();
+                current_url.push_str(control_data.url.as_str()).unwrap();
+            } else if control_data.play_pause {
+                playback_paused = false;
+            }
+            continue;
+        }
+        println!("connecting to {}", current_url);
+
+        let url: String<RADIO_STATION_URL_LEN_MAX> = String::from(current_url.as_str());
+        let mut request = http_client.request(GET, url.as_str()).await.unwrap();
         let headers = [("Icy-MetaData", "1")];
         request = request.headers(&headers);
 
@@ -218,16 +276,15 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                     if key.eq_ignore_ascii_case("icy-metaint") {
                         let icy_metaint_str = unsafe { from_utf8_unchecked(i.1) };
                         icy_metaint = icy_metaint_str.parse().unwrap();
-                        println!("icy_metaint = {}", icy_metaint);
+                        // println!("icy_metaint = {}", icy_metaint);
                     }
                 }
             }
 
             if icy_metaint == 0 {
                 println!("no icy stream");
-                url_index = (url_index + 1) % url_list.len();
-                println!("url = {}", url_list[url_index]);
-                return;
+                playback_paused = true;
+                continue;
             } else {
                 let mut decoder = RawDecoder::new();
                 let mut body_reader = response.body().reader();
@@ -246,11 +303,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                     channels: 0,
                     sample_rate: 0,
                 };
-                let mut frame_data = FrameData {
-                    id: 0,
-                    data: [0; MAX_SAMPLES_PER_FRAME],
-                };
-                const SILENCE_DELAY_FRAME: u64 = 32;
+                let mut frame_data = FrameData::new();
                 let mut send_delay_sum = 0;
                 let mut stats_data = StatsData {
                     frames_send: 0,
@@ -260,31 +313,33 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                 };
                 let mut stats_data_start = Instant::now();
 
-                loop {
+                'outer: loop {
                     if CONTROL_DATA_SIGNAL.signaled() {
                         let control_data = CONTROL_DATA_SIGNAL.wait().await;
                         if control_data.change_url {
-                            url_index = (url_index + 1) % url_list.len();
-                            for j in 0..MAX_SAMPLES_PER_FRAME {
-                                frame_data.data[j] = 0;
-                            }
+                            current_url.clear();
+                            current_url.push_str(control_data.url.as_str()).unwrap();
 
-                            for x in 0..SILENCE_DELAY_FRAME {
-                                frame_data.id = frames_send;
-                                FRAME_CHANNEL.send(frame_data).await;
-                                frames_send += 1;
-                                frame_id += 1;
-                            }
+                            // send silence before change
+                            send_silence().await;
                             break;
-                        } else if control_data.play_pause {}
+                        } else if control_data.play_pause {
+                            playback_paused = true;
+
+                            // send silence before pause
+                            send_silence().await;
+                            break;
+                        }
                     }
 
                     match (body_reader.fill_buf().await) {
                         Ok(mut buf) => {
                             if buf.is_empty() {
                                 println!("lost connection");
-                                url_index = (url_index + 1) % url_list.len();
-                                println!("url = {}", url_list[url_index]);
+                                playback_paused = true;
+
+                                // send silence before pause
+                                send_silence().await;
                                 break;
                             }
                             let buf_len = buf.len();
@@ -325,34 +380,43 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                                     data_buffer[data_buffer_index] = *b;
                                     data_buffer_index = data_buffer_index + 1;
                                     if data_buffer_index == STREAM_BUFFER_SIZE {
-                                        let mut consumed = 0;
-                                        while let Some((frame, bytes_consumed)) = decoder.next(&data_buffer[consumed..], &mut frame_data.data) {
-                                            consumed += bytes_consumed;
-                                            if let Frame::Audio(audio) = frame {
-                                                if meta_data.is_incomplete() {
-                                                    meta_data.channels = audio.channels();
-                                                    meta_data.sample_rate = audio.sample_rate();
-                                                    meta_data.bitrate = audio.bitrate();
-                                                    META_DATA_SIGNAL.signal(meta_data.clone());
-                                                }
-                                                if frame_id > SILENCE_DELAY_FRAME {
-                                                    frame_data.id = frames_send;
-                                                    match FRAME_CHANNEL.try_send(frame_data) {
-                                                        Err(e) => {
-                                                            let send_delay_start = Instant::now();
-                                                            FRAME_CHANNEL.send(frame_data).await;
-                                                            send_delay_sum += send_delay_start.elapsed().as_micros();
-                                                        }
-                                                        _ => {}
+                                        // cant handle 320 so just shut up
+                                        if meta_data.bitrate != 0 && meta_data.bitrate > 192 {
+                                            println!("mp3 decoder error");
+                                            playback_paused = true;
+
+                                            // send silence before pause
+                                            send_silence().await;
+                                            break 'outer;
+                                        } else {
+                                            let mut consumed = 0;
+                                            while let Some((frame, bytes_consumed)) = decoder.next(&data_buffer[consumed..], &mut frame_data.data) {
+                                                consumed += bytes_consumed;
+                                                if let Frame::Audio(audio) = frame {
+                                                    if meta_data.is_incomplete() {
+                                                        meta_data.channels = audio.channels();
+                                                        meta_data.sample_rate = audio.sample_rate();
+                                                        meta_data.bitrate = audio.bitrate();
+                                                        META_DATA_SIGNAL.signal(meta_data.clone());
                                                     }
-                                                    frames_send += 1;
+                                                    if frame_id > SILENCE_DELAY_FRAME {
+                                                        frame_data.id = frames_send;
+                                                        match FRAME_CHANNEL.try_send(frame_data) {
+                                                            Err(e) => {
+                                                                let send_delay_start = Instant::now();
+                                                                FRAME_CHANNEL.send(frame_data).await;
+                                                                send_delay_sum += send_delay_start.elapsed().as_micros();
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                        frames_send += 1;
+                                                    }
+                                                    frame_id += 1;
+                                                    break;
                                                 }
-                                                frame_id += 1;
-                                                break;
                                             }
-                                        }
-                                        data_buffer_index -= consumed;
-                                        {
+                                            // move forward
+                                            data_buffer_index -= consumed;
                                             for i in 0..data_buffer_index {
                                                 data_buffer[i] = data_buffer[i + consumed];
                                             }
@@ -361,8 +425,6 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                                     global_index = global_index + 1;
                                 }
                             }
-                            // println!("{}", time.elapsed().as_millis());
-
                             body_reader.consume(buf_len);
                         }
                         Err(e) => {
@@ -481,12 +543,7 @@ async fn handle_tp_touch_tsc2007(i2c: asynch::i2c::I2cDevice<'static, CriticalSe
                         Orientation::LandscapeFlipped => pos_mapper.map_touch_pos(x, y, width, height, 3),
                     };
 
-                    println!("CONTROL_DATA_SIGNAL.signal");
-                    CONTROL_DATA_SIGNAL.signal(ControlData {
-                        url: String::from(""),
-                        change_url: true,
-                        play_pause: false,
-                    })
+                    TOUCH_DATA_SIGNAL.signal(TouchData::new(x_scaled, y_scaled, z));
                 }
             } else {
                 handle_touch = false;
@@ -705,7 +762,16 @@ async fn main(spawner: Spawner) {
     //
     // let mut transaction = i2s_tx.write_dma_circular_async(tx_buffer).unwrap();
 
-    spawner.must_spawn(handle_radio_stream(stack));
+    let mut url_list: heapless::Vec<String<RADIO_STATION_URL_LEN_MAX>, 4> = heapless::Vec::new();
+    url_list.push(String::from("http://orf-live.ors-shoutcast.at/fm4-q2a")).unwrap();
+    url_list.push(String::from("http://cheetah.streemlion.com:2160/stream")).unwrap();
+    url_list.push(String::from("http://s16.myradiostream.com:7304")).unwrap();
+    url_list.push(String::from("http://167.114.11.79:5674/stream")).unwrap();
+    let mut url_index = 0;
+
+    let default_url: &mut String<RADIO_STATION_URL_LEN_MAX> = make_static!(String::from(url_list[0].as_str()));
+
+    spawner.must_spawn(handle_radio_stream(stack, default_url));
     spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
     if has_tsc2007 {
         spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display.width() as u16, display.height() as u16));
@@ -743,13 +809,15 @@ async fn main(spawner: Spawner) {
             display_text(&mut display, Point::new(0, 60), character_styles.default_character_style(),
                          character_styles.default_text_style(), buf.as_str());
 
-            if meta_data.sample_rate != current_sample_rate {
-                println!("change sample rate to {}", meta_data.sample_rate);
-                current_sample_rate = meta_data.sample_rate;
-                esp32_hal::i2s::private::update_config(Standard::Philips,
-                                                       DataFormat::Data16Channel16,
-                                                       meta_data.sample_rate.Hz(),
-                                                       &clocks);
+            if meta_data.sample_rate != 0 {
+                if meta_data.sample_rate != current_sample_rate {
+                    println!("change sample rate to {}", meta_data.sample_rate);
+                    current_sample_rate = meta_data.sample_rate;
+                    esp32_hal::i2s::private::update_config(Standard::Philips,
+                                                           DataFormat::Data16Channel16,
+                                                           meta_data.sample_rate.Hz(),
+                                                           &clocks);
+                }
             }
         }
         if SEND_STATS_DATA_SIGNAL.signaled() {
@@ -762,6 +830,18 @@ async fn main(spawner: Spawner) {
             let stats_data = RECEIVE_STATS_DATA_SIGNAL.wait().await;
             if stats_data.frames_received != 0 {
                 println!("receive: {} {} {}", stats_data.frames_received, stats_data.receive_delay_sum, stats_data.receive_delay_sum / stats_data.frames_received);
+            }
+        }
+
+        if TOUCH_DATA_SIGNAL.signaled() {
+            let touch_data = TOUCH_DATA_SIGNAL.wait().await;
+            if touch_data.y < (display.height() / 2) as u16 {
+                url_index = (url_index + 1) % url_list.len();
+                println!("control change_url");
+                CONTROL_DATA_SIGNAL.signal(ControlData::new(&url_list[url_index], true, false));
+            } else {
+                println!("control play_pause");
+                CONTROL_DATA_SIGNAL.signal(ControlData::new("", false, true));
             }
         }
 
