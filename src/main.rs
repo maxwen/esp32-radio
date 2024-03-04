@@ -25,9 +25,8 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::Drawable;
-use embedded_graphics::geometry::{Point, Size};
-use embedded_graphics::image::Image;
-use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::geometry::{Dimensions, Point, Size};
+use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::Primitive;
 use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle};
@@ -73,7 +72,7 @@ use rmp3::Frame;
 use static_cell::make_static;
 use static_cell::StaticCell;
 
-use crate::graphics::{GraphicUtils, ListItem};
+use crate::graphics::{Button, GraphicUtils, ListItem, Theme};
 
 mod graphics;
 
@@ -189,7 +188,7 @@ static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 4> = Channel::
 #[derive(Clone, Debug)]
 struct StatusData {
     paused: bool,
-    url_index: usize
+    url_index: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -204,31 +203,17 @@ impl ListItem for RadioStation {
     }
 
     fn get_height(&self) -> u16 {
-        self.get_character_style().font.character_size.height as u16
+        self.get_font().character_size.height as u16
     }
 
-    fn get_character_style(&self) -> MonoTextStyle<'_, Rgb565> {
-        MonoTextStyle::new(
-            &PROFONT_24_POINT,
-            Rgb565::WHITE)
+    fn get_font(&self) -> &MonoFont<'_> {
+        &PROFONT_24_POINT
     }
 
     fn get_text_style(&self) -> TextStyle {
         TextStyleBuilder::new()
             .alignment(Alignment::Left)
             .baseline(Baseline::Top)
-            .build()
-    }
-
-    fn get_background_style(&self) -> PrimitiveStyle<Rgb565> {
-        PrimitiveStyleBuilder::new()
-            .fill_color(Rgb565::BLACK)
-            .build()
-    }
-
-    fn get_selected_style(&self) -> PrimitiveStyle<Rgb565> {
-        PrimitiveStyleBuilder::new()
-            .fill_color(Rgb565::MAGENTA)
             .build()
     }
 }
@@ -238,6 +223,27 @@ impl RadioStation {
         RadioStation {
             url: String::from(url),
             title: String::from(title),
+        }
+    }
+}
+
+impl Theme {
+    fn new_dark_theme() -> Self {
+        Theme {
+            button_background_color: Rgb565::new(9, 37, 20),
+            button_foreground_color: Rgb565::WHITE,
+            screen_background_color: Rgb565::BLACK,
+            text_color_primary: Rgb565::WHITE,
+            highlight_color: Rgb565::new(15, 30, 15),
+        }
+    }
+    fn new_light_theme() -> Self {
+        Theme {
+            button_background_color: Rgb565::new(9, 37, 20),
+            button_foreground_color: Rgb565::WHITE,
+            screen_background_color: Rgb565::WHITE,
+            text_color_primary: Rgb565::BLACK,
+            highlight_color: Rgb565::new(24, 49, 24),
         }
     }
 }
@@ -624,48 +630,49 @@ async fn handle_tp_touch_tsc2007(i2c: asynch::i2c::I2cDevice<'static, CriticalSe
     }
 }
 
-fn display_play_navigation<D>(display: &mut D, width: u16, height: u16, status: &StatusData, bg_color: Rgb565) where D: DrawTarget<Color=Rgb565> {
-    let color = Rgb565::RED;
-    let icon_next = icons::size48px::navigation::ArrowRight::new(color);
-    let icon_play = icons::size48px::music::Play::new(color);
-    let icon_pause = icons::size48px::music::Pause::new(color);
-    let icon_list = icons::size48px::layout::TableRows::new(color);
+fn display_play_navigation<D>(display: &mut D, width: u32, height: u32, status: &StatusData, theme: &Theme) -> Result<(), D::Error>
+    where D: DrawTarget<Color=Rgb565> {
+    let color = theme.button_foreground_color;
+    let icon_next = icons::size24px::navigation::ArrowRight::new(color);
+    let icon_play = icons::size24px::music::Play::new(color);
+    let icon_pause = icons::size24px::music::Pause::new(color);
+    let icon_list = icons::size24px::layout::TableRows::new(color);
 
-    let image_next = Image::new(&icon_next, Point::new(0, (height - 50) as i32));
-    let image_play = Image::new(&icon_play, Point::new((width - 50) as i32, (height - 50) as i32));
-    let image_pause = Image::new(&icon_pause, Point::new((width - 50) as i32, (height - 50) as i32));
-    let image_list = Image::new(&icon_list, Point::new((width / 2 - 25) as i32, (height - 50) as i32));
+    let image_next = Button::new(&icon_next, Point::new(0, (height - GraphicUtils::get_button_size().height) as i32));
+    let image_play = Button::new(&icon_play, Point::new((width - GraphicUtils::get_button_size().width) as i32, (height - GraphicUtils::get_button_size().height) as i32));
+    let image_pause = Button::new(&icon_pause, Point::new((width - GraphicUtils::get_button_size().width) as i32, (height - GraphicUtils::get_button_size().height) as i32));
+    let image_list = Button::new(&icon_list, Point::new((width / 2 - GraphicUtils::get_button_size().width / 2) as i32, (height - GraphicUtils::get_button_size().height) as i32));
 
-    let clear_style = PrimitiveStyleBuilder::new()
-        .fill_color(bg_color)
+    let background_style = PrimitiveStyleBuilder::new()
+        .fill_color(theme.button_background_color)
         .build();
 
     if status.paused {
-        let _ = GraphicUtils::display_image_with_background(display, image_play, clear_style);
+        image_play.draw(display, background_style)?;
     } else {
-        let _ = GraphicUtils::display_image_with_background(display, image_pause, clear_style);
+        image_pause.draw(display, background_style)?;
     }
-    let _ = GraphicUtils::display_image_with_background(display, image_next, clear_style);
-    let _ = GraphicUtils::display_image_with_background(display, image_list, clear_style);
+    image_next.draw(display, background_style)?;
+    image_list.draw(display, background_style)
 }
 
-fn display_list_navigation<D>(display: &mut D, width: u16, height: u16, bg_color: Rgb565) where D: DrawTarget<Color=Rgb565> {
-    let color = Rgb565::RED;
-    let icon_up = icons::size48px::navigation::ArrowUp::new(color);
-    let icon_down = icons::size48px::navigation::ArrowDown::new(color);
-    let icon_select = icons::size48px::music::Play::new(color);
+fn display_list_navigation<D>(display: &mut D, width: u32, height: u32, theme: &Theme) -> Result<(), D::Error>
+    where D: DrawTarget<Color=Rgb565> {
+    let color = theme.button_foreground_color;
+    let icon_up = icons::size24px::navigation::ArrowUp::new(color);
+    let icon_down = icons::size24px::navigation::ArrowDown::new(color);
+    let icon_select = icons::size24px::music::Play::new(color);
 
-    let image_down = Image::new(&icon_up, Point::new(0, (height - 50) as i32));
-    let image_up = Image::new(&icon_down, Point::new((width - 50) as i32, (height - 50) as i32));
-    let image_select = Image::new(&icon_select, Point::new((width / 2 - 25) as i32, (height - 50) as i32));
+    let image_down = Button::new(&icon_up, Point::new(0, (height - GraphicUtils::get_button_size().height) as i32));
+    let image_up = Button::new(&icon_down, Point::new((width - GraphicUtils::get_button_size().width) as i32, (height - GraphicUtils::get_button_size().height) as i32));
+    let image_select = Button::new(&icon_select, Point::new((width / 2 - GraphicUtils::get_button_size().width / 2) as i32, (height - GraphicUtils::get_button_size().height) as i32));
 
-    let clear_style = PrimitiveStyleBuilder::new()
-        .fill_color(bg_color)
+    let background_style = PrimitiveStyleBuilder::new()
+        .fill_color(theme.button_background_color)
         .build();
-
-    let _ = GraphicUtils::display_image_with_background(display, image_down, clear_style);
-    let _ = GraphicUtils::display_image_with_background(display, image_up, clear_style);
-    let _ = GraphicUtils::display_image_with_background(display, image_select, clear_style);
+    image_down.draw(display, background_style)?;
+    image_up.draw(display, background_style)?;
+    image_select.draw(display, background_style)
 }
 
 
@@ -778,21 +785,24 @@ async fn main(spawner: Spawner) {
         display_size,
     ).unwrap();
 
-    let mut character_styles = CharacterStyles::new();
 
-    let background_color_default = Rgb565::BLACK;
-    character_styles.set_background_color(background_color_default);
+    let theme = Theme::new_light_theme();
+    let mut character_styles = CharacterStyles::new_with_color(theme.text_color_primary);
+    character_styles.set_background_color(theme.screen_background_color);
 
-    let display_width = display.width() as u16;
-    let display_height = display.height() as u16;
+    let display_width = display.width() as u32;
+    let display_height = display.height() as u32;
 
-    let icon_left_area = Rectangle::new(Point::new(0, (display_height - 50) as i32), Size::new(50, 50));
-    let icon_right_area = Rectangle::new(Point::new((display_width - 50) as i32, (display_height - 50) as i32), Size::new(50, 50));
-    let icon_middle_area = Rectangle::new(Point::new((display_width / 2 - 25) as i32, (display_height - 50) as i32), Size::new(50, 50));
+    let button_width = GraphicUtils::get_button_size().width;
+    let button_height = GraphicUtils::get_button_size().height;
+
+    let icon_left_area = Rectangle::new(Point::new(0, (display_height - button_height) as i32), GraphicUtils::get_button_size());
+    let icon_right_area = Rectangle::new(Point::new((display_width - button_width) as i32, (display_height - button_height) as i32), GraphicUtils::get_button_size());
+    let icon_middle_area = Rectangle::new(Point::new((display_width / 2 - button_width / 2) as i32, (display_height - button_height) as i32), GraphicUtils::get_button_size());
 
     let mut status = StatusData {
         paused: true,
-        url_index: 0
+        url_index: 0,
     };
 
     let mut meta_data = MetaData {
@@ -802,7 +812,7 @@ async fn main(spawner: Spawner) {
         sample_rate: 0,
     };
 
-    display.clear_screen(background_color_default).unwrap();
+    display.clear_screen(theme.screen_background_color).unwrap();
 
     // let sdcard = embedded_sdmmc::sdcard::SdCard::new(sd_spi, sd_cs, Delay);
     // let mut sdcard_manager = SdcardManager::new(sdcard);
@@ -905,16 +915,18 @@ async fn main(spawner: Spawner) {
 
     let mut current_screen = 0;
 
-    let mut select_list = graphics::List::new(&station_list, Point::new(10, 10), Size::new(display_width as u32, (display_height - 60) as u32));
+    let mut select_list = graphics::List::new(&station_list, Point::new(10, 10),
+                                              Size::new(display_width - 20, (display_height - GraphicUtils::get_button_size().height)),
+                                              &theme);
     select_list.draw(&mut display).unwrap();
-    display_list_navigation(&mut display, display_width, display_height, background_color_default);
+    display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
 
     let default_url: &mut String<RADIO_STATION_URL_LEN_MAX> = make_static!(String::from(station_list.first().unwrap().url.as_str()));
 
     spawner.must_spawn(handle_radio_stream(stack, default_url));
     spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
     if has_tsc2007 {
-        spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display_width, display_height));
+        spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display_width as u16, display_height as u16));
     }
 
     // let mut file_written = 0;
@@ -922,27 +934,27 @@ async fn main(spawner: Spawner) {
     // let mut time = Instant::now();
     let mut current_sample_rate = 44100u32;
     let clear_style = PrimitiveStyleBuilder::new()
-        .fill_color(background_color_default)
+        .fill_color(theme.screen_background_color)
         .build();
-    let title_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb565::MAGENTA)
-        .build();
-    let stats_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb565::GREEN)
-        .build();
-    let artist_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb565::BLUE)
-        .build();
+    // let title_style = PrimitiveStyleBuilder::new()
+    //     .fill_color(Rgb565::MAGENTA)
+    //     .build();
+    // let stats_style = PrimitiveStyleBuilder::new()
+    //     .fill_color(Rgb565::GREEN)
+    //     .build();
+    // let artist_style = PrimitiveStyleBuilder::new()
+    //     .fill_color(Rgb565::BLUE)
+    //     .build();
     loop {
         if META_DATA_SIGNAL.signaled() {
             meta_data = META_DATA_SIGNAL.wait().await;
 
             if current_screen == 1 {
-                display_play_navigation(&mut display, display_width, display_height, &status, background_color_default);
+                display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
 
                 GraphicUtils::display_text_with_background(&mut display, Point::new(10, 10), character_styles.large_character_style(),
                                                            character_styles.default_text_style(), station_list[status.url_index].title.as_str(),
-                                                           title_style, display_width).unwrap();
+                                                           clear_style, display_width).unwrap();
 
                 let mut buf: String<META_DATA_TITLE_LEN_MAX> = String::new();
 
@@ -954,14 +966,14 @@ async fn main(spawner: Spawner) {
                     let (artist, track) = title.split_at(split_pos);
                     GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.default_character_style(),
                                                                character_styles.default_text_style(), artist,
-                                                               artist_style, display_width).unwrap();
+                                                               clear_style, display_width).unwrap();
                     GraphicUtils::display_text_with_background(&mut display, Point::new(10, 60), character_styles.default_character_style(),
                                                                character_styles.default_text_style(), track.strip_prefix(" - ").unwrap_or(track),
                                                                clear_style, display_width).unwrap();
                 } else {
                     GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.default_character_style(),
                                                                character_styles.default_text_style(), title,
-                                                               artist_style, display_width).unwrap();
+                                                               clear_style, display_width).unwrap();
                 }
 
                 buf.clear();
@@ -969,7 +981,7 @@ async fn main(spawner: Spawner) {
 
                 GraphicUtils::display_text_with_background(&mut display, Point::new(10, 80), character_styles.default_character_style(),
                                                            character_styles.default_text_style(), buf.as_str(),
-                                                           stats_style, display_width).unwrap();
+                                                           clear_style, display_width).unwrap();
             }
             if meta_data.sample_rate != 0 {
                 if meta_data.sample_rate != current_sample_rate {
@@ -1015,7 +1027,7 @@ async fn main(spawner: Spawner) {
                     println!("control play_pause");
                     status.paused = !status.paused;
                     CONTROL_DATA_SIGNAL.signal(ControlData::new("", false, true));
-                    display_play_navigation(&mut display, display_width, display_height, &status, background_color_default);
+                    display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 }
             }
             if icon_middle_area.contains(touch_point) {
@@ -1026,13 +1038,13 @@ async fn main(spawner: Spawner) {
                     if status.paused {
                         status.paused = false;
                     }
-                    display.clear_screen(background_color_default).unwrap();
-                    display_play_navigation(&mut display, display_width, display_height, &status, background_color_default);
+                    display.clear_screen(theme.screen_background_color).unwrap();
+                    display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 } else if current_screen == 1 {
                     current_screen = 0;
-                    display.clear_screen(background_color_default).unwrap();
+                    display.clear_screen(theme.screen_background_color).unwrap();
                     select_list.draw(&mut display).unwrap();
-                    display_list_navigation(&mut display, display_width, display_height, background_color_default);
+                    display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
                 }
             }
             if select_list.get_bounding_box().contains(touch_point) {
@@ -1044,8 +1056,8 @@ async fn main(spawner: Spawner) {
                         if status.paused {
                             status.paused = false;
                         }
-                        display.clear_screen(background_color_default).unwrap();
-                        display_play_navigation(&mut display, display_width, display_height, &status, background_color_default);
+                        display.clear_screen(theme.screen_background_color).unwrap();
+                        display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                     }
                 }
             }
