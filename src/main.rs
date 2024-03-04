@@ -25,12 +25,18 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::Drawable;
-use embedded_graphics::geometry::Point;
+use embedded_graphics::geometry::{Point, Size};
+use embedded_graphics::image::Image;
+use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
-use embedded_graphics::text::{Text, TextStyle};
+use embedded_graphics::prelude::Primitive;
+use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle};
+use embedded_graphics::text::{Alignment, Baseline, TextStyle, TextStyleBuilder};
 use embedded_graphics::text::renderer::TextRenderer;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::i2c::I2c;
+use embedded_iconoir::icons;
+use embedded_iconoir::prelude::IconoirNewIcon;
 use embedded_svc::io::asynch::BufRead;
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp32_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
@@ -57,6 +63,7 @@ use esp_wifi::{EspWifiInitFor, initialize};
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 use heapless::String;
 use ili9341::{DisplaySize240x320, Ili9341, Orientation};
+use profont::PROFONT_24_POINT;
 use reqwless::client::HttpClient;
 use reqwless::request::{RequestBody, RequestBuilder};
 use reqwless::request::Method::GET;
@@ -65,6 +72,10 @@ use rmp3::{MAX_SAMPLES_PER_FRAME, RawDecoder};
 use rmp3::Frame;
 use static_cell::make_static;
 use static_cell::StaticCell;
+
+use crate::graphics::{GraphicUtils, ListItem};
+
+mod graphics;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
@@ -119,7 +130,7 @@ static RECEIVE_STATS_DATA_SIGNAL: Signal<CriticalSectionRawMutex, StatsData> = S
 
 const RADIO_STATION_URL_LEN_MAX: usize = 256;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ControlData {
     url: String<RADIO_STATION_URL_LEN_MAX>,
     play_pause: bool,
@@ -168,12 +179,68 @@ impl FrameData {
     fn new() -> Self {
         FrameData {
             id: 0,
-            data: [0i16; MAX_SAMPLES_PER_FRAME]
+            data: [0i16; MAX_SAMPLES_PER_FRAME],
         }
     }
 }
 
 static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 4> = Channel::new();
+
+#[derive(Clone, Debug)]
+struct StatusData {
+    paused: bool,
+    url_index: usize
+}
+
+#[derive(Clone, Debug)]
+struct RadioStation {
+    url: String<RADIO_STATION_URL_LEN_MAX>,
+    title: String<META_DATA_TITLE_LEN_MAX>,
+}
+
+impl ListItem for RadioStation {
+    fn get_text(&self) -> String<256> {
+        String::from(self.title.as_str())
+    }
+
+    fn get_height(&self) -> u16 {
+        self.get_character_style().font.character_size.height as u16
+    }
+
+    fn get_character_style(&self) -> MonoTextStyle<'_, Rgb565> {
+        MonoTextStyle::new(
+            &PROFONT_24_POINT,
+            Rgb565::WHITE)
+    }
+
+    fn get_text_style(&self) -> TextStyle {
+        TextStyleBuilder::new()
+            .alignment(Alignment::Left)
+            .baseline(Baseline::Top)
+            .build()
+    }
+
+    fn get_background_style(&self) -> PrimitiveStyle<Rgb565> {
+        PrimitiveStyleBuilder::new()
+            .fill_color(Rgb565::BLACK)
+            .build()
+    }
+
+    fn get_selected_style(&self) -> PrimitiveStyle<Rgb565> {
+        PrimitiveStyleBuilder::new()
+            .fill_color(Rgb565::MAGENTA)
+            .build()
+    }
+}
+
+impl RadioStation {
+    fn new(title: &str, url: &str) -> Self {
+        RadioStation {
+            url: String::from(url),
+            title: String::from(title),
+        }
+    }
+}
 
 macro_rules! singleton {
     ($val:expr, $typ:ty) => {{
@@ -230,7 +297,7 @@ async fn send_silence() {
 #[embassy_executor::task]
 pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>, default_url: &'static str) {
     let mut current_url: String<RADIO_STATION_URL_LEN_MAX> = String::from(default_url);
-    let mut playback_paused = false;
+    let mut playback_paused = true;
 
     // let mut tls_read_buffer = [0; 4096];
     // let mut tls_write_buffer = [0; 4096];
@@ -254,7 +321,8 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
             if control_data.change_url {
                 current_url.clear();
                 current_url.push_str(control_data.url.as_str()).unwrap();
-            } else if control_data.play_pause {
+            }
+            if control_data.play_pause {
                 playback_paused = false;
             }
             continue;
@@ -440,6 +508,10 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                     }
                 }
             }
+        } else {
+            playback_paused = true;
+            // send silence before pause
+            send_silence().await;
         }
     }
 }
@@ -552,15 +624,48 @@ async fn handle_tp_touch_tsc2007(i2c: asynch::i2c::I2cDevice<'static, CriticalSe
     }
 }
 
-fn display_text<D, S>(display: &mut D, pos: Point, character_style: S,
-                      text_style: TextStyle, text: &str) where D: DrawTarget<Color=Rgb565>, S: TextRenderer<Color=Rgb565> {
-    let _ = Text::with_text_style(
-        text,
-        pos,
-        character_style,
-        text_style,
-    )
-        .draw(display);
+fn display_play_navigation<D>(display: &mut D, width: u16, height: u16, status: &StatusData, bg_color: Rgb565) where D: DrawTarget<Color=Rgb565> {
+    let color = Rgb565::RED;
+    let icon_next = icons::size48px::navigation::ArrowRight::new(color);
+    let icon_play = icons::size48px::music::Play::new(color);
+    let icon_pause = icons::size48px::music::Pause::new(color);
+    let icon_list = icons::size48px::layout::TableRows::new(color);
+
+    let image_next = Image::new(&icon_next, Point::new(0, (height - 50) as i32));
+    let image_play = Image::new(&icon_play, Point::new((width - 50) as i32, (height - 50) as i32));
+    let image_pause = Image::new(&icon_pause, Point::new((width - 50) as i32, (height - 50) as i32));
+    let image_list = Image::new(&icon_list, Point::new((width / 2 - 25) as i32, (height - 50) as i32));
+
+    let clear_style = PrimitiveStyleBuilder::new()
+        .fill_color(bg_color)
+        .build();
+
+    if status.paused {
+        let _ = GraphicUtils::display_image_with_background(display, image_play, clear_style);
+    } else {
+        let _ = GraphicUtils::display_image_with_background(display, image_pause, clear_style);
+    }
+    let _ = GraphicUtils::display_image_with_background(display, image_next, clear_style);
+    let _ = GraphicUtils::display_image_with_background(display, image_list, clear_style);
+}
+
+fn display_list_navigation<D>(display: &mut D, width: u16, height: u16, bg_color: Rgb565) where D: DrawTarget<Color=Rgb565> {
+    let color = Rgb565::RED;
+    let icon_up = icons::size48px::navigation::ArrowUp::new(color);
+    let icon_down = icons::size48px::navigation::ArrowDown::new(color);
+    let icon_select = icons::size48px::music::Play::new(color);
+
+    let image_down = Image::new(&icon_up, Point::new(0, (height - 50) as i32));
+    let image_up = Image::new(&icon_down, Point::new((width - 50) as i32, (height - 50) as i32));
+    let image_select = Image::new(&icon_select, Point::new((width / 2 - 25) as i32, (height - 50) as i32));
+
+    let clear_style = PrimitiveStyleBuilder::new()
+        .fill_color(bg_color)
+        .build();
+
+    let _ = GraphicUtils::display_image_with_background(display, image_down, clear_style);
+    let _ = GraphicUtils::display_image_with_background(display, image_up, clear_style);
+    let _ = GraphicUtils::display_image_with_background(display, image_select, clear_style);
 }
 
 
@@ -634,6 +739,7 @@ async fn main(spawner: Spawner) {
 
     let mut i2c0_dev1 = asynch::i2c::I2cDevice::new(i2c0_bus_static);
     let has_tsc2007 = i2c0_dev1.read(TSC2007_ADDR, &mut [0]).await.is_ok();
+    println!("has_tsc2007 = {}", has_tsc2007);
 
     let sclk = io.pins.gpio5;
     let miso = io.pins.gpio21;
@@ -676,6 +782,25 @@ async fn main(spawner: Spawner) {
 
     let background_color_default = Rgb565::BLACK;
     character_styles.set_background_color(background_color_default);
+
+    let display_width = display.width() as u16;
+    let display_height = display.height() as u16;
+
+    let icon_left_area = Rectangle::new(Point::new(0, (display_height - 50) as i32), Size::new(50, 50));
+    let icon_right_area = Rectangle::new(Point::new((display_width - 50) as i32, (display_height - 50) as i32), Size::new(50, 50));
+    let icon_middle_area = Rectangle::new(Point::new((display_width / 2 - 25) as i32, (display_height - 50) as i32), Size::new(50, 50));
+
+    let mut status = StatusData {
+        paused: true,
+        url_index: 0
+    };
+
+    let mut meta_data = MetaData {
+        title: String::from(""),
+        bitrate: 0,
+        channels: 2,
+        sample_rate: 0,
+    };
 
     display.clear_screen(background_color_default).unwrap();
 
@@ -762,53 +887,90 @@ async fn main(spawner: Spawner) {
     //
     // let mut transaction = i2s_tx.write_dma_circular_async(tx_buffer).unwrap();
 
-    let mut url_list: heapless::Vec<String<RADIO_STATION_URL_LEN_MAX>, 4> = heapless::Vec::new();
-    url_list.push(String::from("http://orf-live.ors-shoutcast.at/fm4-q2a")).unwrap();
-    url_list.push(String::from("http://cheetah.streemlion.com:2160/stream")).unwrap();
-    url_list.push(String::from("http://s16.myradiostream.com:7304")).unwrap();
-    url_list.push(String::from("http://167.114.11.79:5674/stream")).unwrap();
-    let mut url_index = 0;
+    let mut station_list: Vec<RadioStation> = Vec::new();
+    station_list.push(RadioStation::new("FM4", "http://orf-live.ors-shoutcast.at/fm4-q2a"));
+    station_list.push(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
+    station_list.push(RadioStation::new("Terry Callaghan's Classic Alternative Channel", "http://s16.myradiostream.com:7304"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
 
-    let default_url: &mut String<RADIO_STATION_URL_LEN_MAX> = make_static!(String::from(url_list[0].as_str()));
+    let mut current_screen = 0;
+
+    let mut select_list = graphics::List::new(&station_list, Point::new(10, 10), Size::new(display_width as u32, (display_height - 60) as u32));
+    select_list.draw(&mut display).unwrap();
+    display_list_navigation(&mut display, display_width, display_height, background_color_default);
+
+    let default_url: &mut String<RADIO_STATION_URL_LEN_MAX> = make_static!(String::from(station_list.first().unwrap().url.as_str()));
 
     spawner.must_spawn(handle_radio_stream(stack, default_url));
     spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
     if has_tsc2007 {
-        spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display.width() as u16, display.height() as u16));
+        spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display_width, display_height));
     }
 
     // let mut file_written = 0;
     // let mut file_done = false;
     // let mut time = Instant::now();
     let mut current_sample_rate = 44100u32;
+    let clear_style = PrimitiveStyleBuilder::new()
+        .fill_color(background_color_default)
+        .build();
+    let title_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::MAGENTA)
+        .build();
+    let stats_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::GREEN)
+        .build();
+    let artist_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::BLUE)
+        .build();
     loop {
         if META_DATA_SIGNAL.signaled() {
-            let meta_data = META_DATA_SIGNAL.wait().await;
-            display.clear_screen(background_color_default).unwrap();
+            meta_data = META_DATA_SIGNAL.wait().await;
 
-            let mut buf: String<META_DATA_TITLE_LEN_MAX> = String::new();
+            if current_screen == 1 {
+                display_play_navigation(&mut display, display_width, display_height, &status, background_color_default);
 
-            let mut title = meta_data.title.strip_prefix("StreamTitle='").unwrap_or(meta_data.title.as_str());
-            title = title.strip_suffix("';").unwrap_or(meta_data.title.as_str());
+                GraphicUtils::display_text_with_background(&mut display, Point::new(10, 10), character_styles.large_character_style(),
+                                                           character_styles.default_text_style(), station_list[status.url_index].title.as_str(),
+                                                           title_style, display_width).unwrap();
 
-            let split_pos = title.find(" - ").unwrap_or(0);
-            if split_pos != 0 {
-                let (artist, track) = title.split_at(split_pos);
-                display_text(&mut display, Point::new(0, 0), character_styles.default_character_style(),
-                             character_styles.default_text_style(), artist);
-                display_text(&mut display, Point::new(0, 30), character_styles.default_character_style(),
-                             character_styles.default_text_style(), track.strip_prefix(" - ").unwrap_or(track));
-            } else {
-                display_text(&mut display, Point::new(0, 0), character_styles.default_character_style(),
-                             character_styles.default_text_style(), title);
+                let mut buf: String<META_DATA_TITLE_LEN_MAX> = String::new();
+
+                let mut title = meta_data.title.strip_prefix("StreamTitle='").unwrap_or(meta_data.title.as_str());
+                title = title.strip_suffix("';").unwrap_or(meta_data.title.as_str());
+
+                let split_pos = title.find(" - ").unwrap_or(0);
+                if split_pos != 0 {
+                    let (artist, track) = title.split_at(split_pos);
+                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.default_character_style(),
+                                                               character_styles.default_text_style(), artist,
+                                                               artist_style, display_width).unwrap();
+                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 60), character_styles.default_character_style(),
+                                                               character_styles.default_text_style(), track.strip_prefix(" - ").unwrap_or(track),
+                                                               clear_style, display_width).unwrap();
+                } else {
+                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.default_character_style(),
+                                                               character_styles.default_text_style(), title,
+                                                               artist_style, display_width).unwrap();
+                }
+
+                buf.clear();
+                write!(buf, "{} / {} / {}", meta_data.sample_rate, meta_data.channels, meta_data.bitrate).unwrap();
+
+                GraphicUtils::display_text_with_background(&mut display, Point::new(10, 80), character_styles.default_character_style(),
+                                                           character_styles.default_text_style(), buf.as_str(),
+                                                           stats_style, display_width).unwrap();
             }
-
-            buf.clear();
-            write!(buf, "{} / {} / {}", meta_data.sample_rate, meta_data.channels, meta_data.bitrate).unwrap();
-
-            display_text(&mut display, Point::new(0, 60), character_styles.default_character_style(),
-                         character_styles.default_text_style(), buf.as_str());
-
             if meta_data.sample_rate != 0 {
                 if meta_data.sample_rate != current_sample_rate {
                     println!("change sample rate to {}", meta_data.sample_rate);
@@ -835,13 +997,57 @@ async fn main(spawner: Spawner) {
 
         if TOUCH_DATA_SIGNAL.signaled() {
             let touch_data = TOUCH_DATA_SIGNAL.wait().await;
-            if touch_data.y < (display.height() / 2) as u16 {
-                url_index = (url_index + 1) % url_list.len();
-                println!("control change_url");
-                CONTROL_DATA_SIGNAL.signal(ControlData::new(&url_list[url_index], true, false));
-            } else {
-                println!("control play_pause");
-                CONTROL_DATA_SIGNAL.signal(ControlData::new("", false, true));
+            let touch_point = Point::new(touch_data.x as i32, touch_data.y as i32);
+            if icon_left_area.contains(touch_point) {
+                if current_screen == 0 {
+                    select_list.scroll_up(&mut display).unwrap();
+                } else if current_screen == 1 {
+                    status.url_index = (status.url_index + 1) % station_list.len();
+                    select_list.set_selected_index(status.url_index);
+                    println!("control change_url");
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, false));
+                }
+            }
+            if icon_right_area.contains(touch_point) {
+                if current_screen == 0 {
+                    select_list.scroll_down(&mut display).unwrap();
+                } else if current_screen == 1 {
+                    println!("control play_pause");
+                    status.paused = !status.paused;
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new("", false, true));
+                    display_play_navigation(&mut display, display_width, display_height, &status, background_color_default);
+                }
+            }
+            if icon_middle_area.contains(touch_point) {
+                if current_screen == 0 {
+                    current_screen = 1;
+                    status.url_index = select_list.get_selected_index();
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, if status.paused { true } else { false }));
+                    if status.paused {
+                        status.paused = false;
+                    }
+                    display.clear_screen(background_color_default).unwrap();
+                    display_play_navigation(&mut display, display_width, display_height, &status, background_color_default);
+                } else if current_screen == 1 {
+                    current_screen = 0;
+                    display.clear_screen(background_color_default).unwrap();
+                    select_list.draw(&mut display).unwrap();
+                    display_list_navigation(&mut display, display_width, display_height, background_color_default);
+                }
+            }
+            if select_list.get_bounding_box().contains(touch_point) {
+                if let Ok(selected_index) = select_list.select_at_pos(&mut display, touch_point) {
+                    if selected_index != status.url_index {
+                        current_screen = 1;
+                        status.url_index = selected_index;
+                        CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, if status.paused { true } else { false }));
+                        if status.paused {
+                            status.paused = false;
+                        }
+                        display.clear_screen(background_color_default).unwrap();
+                        display_play_navigation(&mut display, display_width, display_height, &status, background_color_default);
+                    }
+                }
             }
         }
 
@@ -887,6 +1093,6 @@ async fn main(spawner: Spawner) {
         //     }
         //     frame_index += 1;
         // }
-        Timer::after(Duration::from_millis(500)).await
+        Timer::after(Duration::from_millis(100)).await
     }
 }

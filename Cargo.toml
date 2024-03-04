@@ -32,7 +32,8 @@ reqwless = { version = "0.11.0", features = ["alloc"] }
 rmp3 = {  version = "0.3", default-features = false, features = ["simd"] }
 profont = "0.7.0"
 eg-seven-segment = "0.2.0"
-esp32-utils-crate = { git = "https://github.com/maxwen/esp32-utils-crate" }
+esp32-utils-crate = { path = "../esp32-utils-crate" }
+embedded-iconoir = { version = "0.2.3", features = ["96px", "48px"] }
 
 [profile.dev]
 opt-level = 3
@@ -41,7 +42,7 @@ opt-level = 3
 opt-level = 3
 
 [patch.crates-io]
-esp-hal-common = { path = "/home/maxl/esp32/rust/esp-hal-legacy/esp-hal-common" }
+esp-hal-common = { git = "https://github.com/maxwen/esp-hal", branch = "0.15.0" }
 reqwless = { path = "/home/maxl/esp32/rust/reqwless" }
 rmp3 = { git = "https://github.com/maxwen/rmp3" }
 ili9341 = { git = "https://github.com/maxwen/ili9341-rs" }
