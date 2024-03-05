@@ -286,6 +286,7 @@ pub struct Theme {
     pub screen_background_color: Rgb565,
     pub text_color_primary: Rgb565,
     pub highlight_color: Rgb565,
+    pub error_color: Rgb565,
 }
 
 pub struct Progress<'a, T> {

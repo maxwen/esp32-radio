@@ -27,7 +27,7 @@ use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::Drawable;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
-use embedded_graphics::mono_font::MonoFont;
+use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::Primitive;
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
@@ -66,6 +66,7 @@ use heapless::String;
 use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 use profont::PROFONT_24_POINT;
 use reqwless::client::HttpClient;
+use reqwless::headers::ContentType::AudioMpeg;
 use reqwless::request::{RequestBody, RequestBuilder};
 use reqwless::request::Method::GET;
 use reqwless::response::Status;
@@ -75,6 +76,7 @@ use serde::{Deserialize, Serialize};
 use static_cell::make_static;
 use static_cell::StaticCell;
 
+use crate::Error::NoError;
 use crate::graphics::{Button, GraphicUtils, ListItem, Progress, Theme};
 
 mod graphics;
@@ -141,12 +143,29 @@ struct ControlData {
 }
 
 impl ControlData {
-    fn new(url: &str, change_url: bool, play: bool, pause: bool) -> Self {
+    fn new_change_url(url: &str) -> Self {
         ControlData {
             url: String::from(url),
-            play,
-            pause,
-            change_url
+            play: true,
+            pause: false,
+            change_url: true,
+        }
+    }
+    fn new_pause() -> Self {
+        ControlData {
+            url: String::from(""),
+            play: false,
+            pause: true,
+            change_url: false,
+        }
+    }
+
+    fn new_play(url: &str) -> Self {
+        ControlData {
+            url: String::from(url),
+            play: true,
+            pause: false,
+            change_url: true,
         }
     }
 }
@@ -191,26 +210,62 @@ impl FrameData {
 static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 4> = Channel::new();
 
 #[derive(Clone, Debug)]
+enum Error {
+    NoError,
+    ConnectionError,
+    ConnectionLost,
+    DecoderError,
+    FormatError,
+}
+
+fn get_error_description<'a>(error_type: Error) -> &'a str {
+    match error_type {
+        NoError => { "" }
+        Error::ConnectionError => { "Connection error" }
+        Error::ConnectionLost => { "Connection lost" }
+        Error::DecoderError => { "Decoder error" }
+        Error::FormatError => { "Stream format error" }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct StatusData {
     paused: bool,
     url_index: usize,
-    error: bool
+    error: bool,
+    error_type: Error,
 }
 
 impl StatusData {
-    fn new(paused: bool, url_index: usize) -> Self {
+    fn new_default() -> Self {
         StatusData {
-            paused,
-            url_index,
-            error: false
+            paused: true,
+            url_index: 0,
+            error: false,
+            error_type: NoError,
         }
     }
-    fn new_error() -> Self {
+
+    fn new_error(error_type: Error) -> Self {
         StatusData {
             paused: false,
             url_index: 0,
-            error: true
+            error: true,
+            error_type,
         }
+    }
+
+    fn set_paused(&mut self) {
+        self.paused = true;
+    }
+
+    fn set_playing(&mut self, url_index: usize) {
+        self.paused = false;
+        self.url_index = url_index;
+    }
+
+    fn toggle_playing(&mut self) {
+        self.paused = !self.paused;
     }
 }
 
@@ -224,7 +279,7 @@ struct RadioStation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RadioStationList {
-    list: Vec<RadioStation>
+    list: Vec<RadioStation>,
 }
 
 impl ListItem for RadioStation {
@@ -265,6 +320,7 @@ impl Theme {
             screen_background_color: Rgb565::BLACK,
             text_color_primary: Rgb565::WHITE,
             highlight_color: Rgb565::new(15, 30, 15),
+            error_color: Rgb565::RED,
         }
     }
     fn new_light_theme() -> Self {
@@ -274,6 +330,7 @@ impl Theme {
             screen_background_color: Rgb565::WHITE,
             text_color_primary: Rgb565::BLACK,
             highlight_color: Rgb565::new(24, 49, 24),
+            error_color: Rgb565::RED,
         }
     }
 }
@@ -348,7 +405,6 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
 
     // let tls_config = TlsConfig::new(123456789u64, &mut tls_read_buffer, &mut tls_write_buffer, TlsVerify::None);
     let mut http_client = HttpClient::new(&tcp_client, &dns);
-
     loop {
         if playback_paused {
             println!("playback paused");
@@ -375,13 +431,19 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
             println!("error connecting");
             playback_paused = true;
 
-            STATUS_DATA_SIGNAL.signal(StatusData::new_error());
+            STATUS_DATA_SIGNAL.signal(StatusData::new_error(Error::ConnectionError));
             continue;
         }
         let response = response_result.unwrap();
         if response.status == Status::Ok {
             println!("connected to {}", current_url);
 
+            if response.content_type != Some(AudioMpeg) {
+                playback_paused = true;
+
+                STATUS_DATA_SIGNAL.signal(StatusData::new_error(Error::FormatError));
+                continue;
+            }
             for i in response.headers() {
                 let key = i.0;
                 if key.starts_with("icy") {
@@ -389,7 +451,6 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                     if key.eq_ignore_ascii_case("icy-metaint") {
                         let icy_metaint_str = unsafe { from_utf8_unchecked(i.1) };
                         icy_metaint = icy_metaint_str.parse().unwrap();
-                        // println!("icy_metaint = {}", icy_metaint);
                     }
                 }
             }
@@ -398,7 +459,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                 println!("no icy stream");
                 playback_paused = true;
 
-                STATUS_DATA_SIGNAL.signal(StatusData::new_error());
+                STATUS_DATA_SIGNAL.signal(StatusData::new_error(Error::FormatError));
                 continue;
             } else {
                 let mut decoder = RawDecoder::new();
@@ -454,7 +515,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                                 println!("lost connection");
                                 playback_paused = true;
 
-                                STATUS_DATA_SIGNAL.signal(StatusData::new_error());
+                                STATUS_DATA_SIGNAL.signal(StatusData::new_error(Error::ConnectionLost));
 
                                 // send silence before pause
                                 send_silence().await;
@@ -499,9 +560,11 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                                     data_buffer_index = data_buffer_index + 1;
                                     if data_buffer_index == STREAM_BUFFER_SIZE {
                                         // cant handle 320 so just shut up
-                                        if meta_data.bitrate != 0 && meta_data.bitrate > 192 {
+                                        if meta_data.bitrate != 0 && meta_data.bitrate > 256 {
                                             println!("mp3 decoder error");
                                             playback_paused = true;
+
+                                            STATUS_DATA_SIGNAL.signal(StatusData::new_error(Error::DecoderError));
 
                                             // send silence before pause
                                             send_silence().await;
@@ -563,7 +626,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
 
             playback_paused = true;
 
-            STATUS_DATA_SIGNAL.signal(StatusData::new_error());
+            STATUS_DATA_SIGNAL.signal(StatusData::new_error(Error::ConnectionError));
         }
     }
 }
@@ -733,7 +796,6 @@ fn display_list_navigation<D>(display: &mut D, width: u32, height: u32, theme: &
     image_select.draw(display, background_style)
 }
 
-
 #[main]
 async fn main(spawner: Spawner) {
     let peripherals = Peripherals::take();
@@ -759,7 +821,6 @@ async fn main(spawner: Spawner) {
         system.radio_clock_control,
         &clocks,
     ).unwrap();
-
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
 
@@ -855,7 +916,7 @@ async fn main(spawner: Spawner) {
     let icon_right_area = Rectangle::new(get_right_button_pos(display_width, display_height), GraphicUtils::get_button_size());
     let icon_middle_area = Rectangle::new(get_middle_button_pos(display_width, display_height), GraphicUtils::get_button_size());
 
-    let mut status = StatusData::new(false, 0);
+    let mut status = StatusData::new_default();
 
     let mut meta_data = MetaData {
         title: String::from(""),
@@ -882,16 +943,16 @@ async fn main(spawner: Spawner) {
     }
     let mut station_list: Vec<RadioStation> = Vec::new();
 
-    for file in &root_file_list {
-        if file.name.to_string() == "RADIO.JSO" {
-            let mut buffer_vec = vec![0; file.size as usize];
-            let load_result = sdcard_manager.load_root_dir_file_into_buffer("RADIO.JSO", &mut buffer_vec);
-            if load_result.is_ok() {
-                let mut sd_station_list = serde_json_core::from_slice::<RadioStationList>(buffer_vec.as_slice()).unwrap().0;
-                station_list.append(&mut sd_station_list.list);
-            }
-        }
-    }
+    // for file in &root_file_list {
+    //     if file.name.to_string() == "RADIO.JSO" {
+    //         let mut buffer_vec = vec![0; file.size as usize];
+    //         let load_result = sdcard_manager.load_root_dir_file_into_buffer("RADIO.JSO", &mut buffer_vec);
+    //         if load_result.is_ok() {
+    //             let mut sd_station_list = serde_json_core::from_slice::<RadioStationList>(buffer_vec.as_slice()).unwrap().0;
+    //             station_list.append(&mut sd_station_list.list);
+    //         }
+    //     }
+    // }
 
     progress.update_text(&mut display, "Connecting to Wifi...").unwrap();
 
@@ -959,6 +1020,7 @@ async fn main(spawner: Spawner) {
         station_list.push(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
         station_list.push(RadioStation::new("Terry Callaghan's Classic Alternative Channel", "http://s16.myradiostream.com:7304"));
         station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+        station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
     }
 
     let mut current_screen = 0;
@@ -984,6 +1046,11 @@ async fn main(spawner: Spawner) {
     let clear_style = PrimitiveStyleBuilder::new()
         .fill_color(theme.screen_background_color)
         .build();
+
+    let error_character_style = MonoTextStyle::new(
+        character_styles.medium_character_style().font,
+        theme.error_color);
+
     // let title_style = PrimitiveStyleBuilder::new()
     //     .fill_color(Rgb565::MAGENTA)
     //     .build();
@@ -993,6 +1060,12 @@ async fn main(spawner: Spawner) {
     // let artist_style = PrimitiveStyleBuilder::new()
     //     .fill_color(Rgb565::BLUE)
     //     .build();
+
+    let title_line_pos = Point::new(10, 10);
+    let meta_first_line_pos = Point::new(10, 40);
+    let meta_second_line_pos = Point::new(10, 60);
+    let format_line_pos = Point::new(10, 80);
+    let error_line_pos = Point::new(10, 120);
     loop {
         if META_DATA_SIGNAL.signaled() {
             meta_data = META_DATA_SIGNAL.wait().await;
@@ -1000,7 +1073,13 @@ async fn main(spawner: Spawner) {
             if current_screen == 1 {
                 display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
 
-                GraphicUtils::display_text_with_background(&mut display, Point::new(10, 10), character_styles.large_character_style(),
+                // clear error
+                GraphicUtils::display_text_with_background(&mut display, error_line_pos, error_character_style,
+                                                           character_styles.default_text_style(),
+                                                           GraphicUtils::get_text_with_ellipsis_from_str(display_width, " ", character_styles.medium_character_style().font).as_str(),
+                                                           clear_style, display_width).unwrap();
+
+                GraphicUtils::display_text_with_background(&mut display, title_line_pos, character_styles.large_character_style(),
                                                            character_styles.default_text_style(), station_list[status.url_index].title.as_str(),
                                                            clear_style, display_width).unwrap();
 
@@ -1012,16 +1091,16 @@ async fn main(spawner: Spawner) {
                 let split_pos = title.find(" - ").unwrap_or(0);
                 if split_pos != 0 {
                     let (artist, track) = title.split_at(split_pos);
-                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.medium_character_style(),
+                    GraphicUtils::display_text_with_background(&mut display, meta_first_line_pos, character_styles.medium_character_style(),
                                                                character_styles.default_text_style(),
                                                                GraphicUtils::get_text_with_ellipsis_from_str(display_width, artist, character_styles.medium_character_style().font).as_str(),
                                                                clear_style, display_width).unwrap();
-                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 60), character_styles.medium_character_style(),
+                    GraphicUtils::display_text_with_background(&mut display, meta_second_line_pos, character_styles.medium_character_style(),
                                                                character_styles.default_text_style(),
                                                                GraphicUtils::get_text_with_ellipsis_from_str(display_width, track.strip_prefix(" - ").unwrap_or(track), character_styles.medium_character_style().font).as_str(),
                                                                clear_style, display_width).unwrap();
                 } else {
-                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.medium_character_style(),
+                    GraphicUtils::display_text_with_background(&mut display, meta_first_line_pos, character_styles.medium_character_style(),
                                                                character_styles.default_text_style(),
                                                                GraphicUtils::get_text_with_ellipsis_from_str(display_width, title, character_styles.medium_character_style().font).as_str(),
                                                                clear_style, display_width).unwrap();
@@ -1030,7 +1109,7 @@ async fn main(spawner: Spawner) {
                 buf.clear();
                 write!(buf, "{} / {} / {}", meta_data.sample_rate, meta_data.channels, meta_data.bitrate).unwrap();
 
-                GraphicUtils::display_text_with_background(&mut display, Point::new(10, 80), character_styles.medium_character_style(),
+                GraphicUtils::display_text_with_background(&mut display, format_line_pos, character_styles.medium_character_style(),
                                                            character_styles.default_text_style(),
                                                            buf.as_str(),
                                                            clear_style, display_width).unwrap();
@@ -1062,14 +1141,16 @@ async fn main(spawner: Spawner) {
         if TOUCH_DATA_SIGNAL.signaled() {
             let touch_data = TOUCH_DATA_SIGNAL.wait().await;
             let touch_point = Point::new(touch_data.x as i32, touch_data.y as i32);
+
             if icon_left_area.contains(touch_point) {
                 if current_screen == 0 {
                     select_list.scroll_up(&mut display).unwrap();
                 } else if current_screen == 1 {
-                    status.url_index = (status.url_index + 1) % station_list.len();
-                    select_list.set_selected_index(status.url_index);
                     println!("control change_url");
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, true, false));
+                    let url_index_new = (status.url_index + 1) % station_list.len();
+                    status.set_playing(url_index_new);
+                    select_list.set_selected_index(url_index_new);
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[url_index_new].url));
                 }
             }
             if icon_right_area.contains(touch_point) {
@@ -1077,46 +1158,58 @@ async fn main(spawner: Spawner) {
                     select_list.scroll_down(&mut display).unwrap();
                 } else if current_screen == 1 {
                     println!("control play_pause");
-                    status.paused = !status.paused;
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new("", false, !status.paused, status.paused));
+                    status.toggle_playing();
+                    if status.paused {
+                        CONTROL_DATA_SIGNAL.signal(ControlData::new_pause());
+                    } else {
+                        CONTROL_DATA_SIGNAL.signal(ControlData::new_play(&station_list[status.url_index].url));
+                    }
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 }
             }
             if icon_middle_area.contains(touch_point) {
                 if current_screen == 0 {
                     current_screen = 1;
-                    status.url_index = select_list.get_selected_index();
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, true, false));
-                    status.paused = false;
                     display.clear_screen(theme.screen_background_color).unwrap();
+
+                    let url_index_new = select_list.get_selected_index();
+                    status.set_playing(url_index_new);
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[url_index_new].url));
+
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 } else if current_screen == 1 {
                     current_screen = 0;
                     display.clear_screen(theme.screen_background_color).unwrap();
+
                     select_list.draw(&mut display).unwrap();
                     display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
                 }
             }
             if select_list.get_bounding_box().contains(touch_point) {
                 if let Ok(selected_index) = select_list.select_at_pos(&mut display, touch_point) {
-                    // if selected_index != status.url_index {
-                        current_screen = 1;
-                        status.url_index = selected_index;
-                        CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, true, false));
-                        status.paused = false;
-                        display.clear_screen(theme.screen_background_color).unwrap();
-                        display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
-                    // }
+                    current_screen = 1;
+                    display.clear_screen(theme.screen_background_color).unwrap();
+
+                    status.set_playing(selected_index);
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[selected_index].url));
+
+                    display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 }
             }
         }
         if STATUS_DATA_SIGNAL.signaled() {
             let error_status = STATUS_DATA_SIGNAL.wait().await;
             if error_status.error {
-                // TODO show error string
-                status.paused = true;
+                status.set_paused();
                 if current_screen == 1 {
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
+
+                    GraphicUtils::display_text_with_background(&mut display, error_line_pos, error_character_style,
+                                                               character_styles.default_text_style(),
+                                                               GraphicUtils::get_text_with_ellipsis_from_str(display_width,
+                                                                                                             get_error_description(error_status.error_type),
+                                                                                                             character_styles.medium_character_style().font).as_str(),
+                                                               clear_style, display_width).unwrap();
                 }
             }
         }
@@ -1144,24 +1237,6 @@ async fn main(spawner: Spawner) {
         //     frame_index += 1;
         // }
 
-        // let frame_data = FRAME_CHANNEL.receive().await;
-        // let mut frame_index = 0;
-        //
-        // while frame_index < MAX_SAMPLE_PER_FRAME_DATA {
-        //     let frame_data_part = frame_data.data[frame_index];
-        //     let frame_data_part_u8 =
-        //         unsafe { core::slice::from_raw_parts(&frame_data_part as *const _ as *const u8, frame_data_part.len() * 2) };
-        //     let mut written_bytes = 0;
-        //     while written_bytes != frame_data_part_u8.len() {
-        //         match transaction.push(&frame_data_part_u8[written_bytes..]).await {
-        //             Ok(written) => {
-        //                 written_bytes += written;
-        //             }
-        //             Err(e) => { println!("transaction.push error ={:?}", e) }
-        //         }
-        //     }
-        //     frame_index += 1;
-        // }
         Timer::after(Duration::from_millis(100)).await
     }
 }
