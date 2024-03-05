@@ -1,0 +1,16 @@
+{
+  "list": [
+    {
+      "title": "FM4",
+      "url": "http://orf-live.ors-shoutcast.at/fm4-q2a"
+    },
+    {
+      "title": "OE3",
+      "url": "http://orf-live.ors-shoutcast.at/oe3-q2a"
+    },
+    {
+      "title": "MetalRock.FM",
+      "url": "http://cheetah.streemlion.com:2160/stream"
+    }
+  ]
+}
