@@ -34,6 +34,8 @@ profont = "0.7.0"
 eg-seven-segment = "0.2.0"
 esp32-utils-crate = { path = "../esp32-utils-crate" }
 embedded-iconoir = { version = "0.2.3", features = ["96px", "48px"] }
+serde-json-core = { version = "0.5.1", features = ["heapless"] }
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
 
 [profile.dev]
 opt-level = 3

@@ -8,10 +8,10 @@ use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::Primitive;
 use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle};
-use embedded_graphics::text::{Text, TextStyle};
+use embedded_graphics::text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder};
 use embedded_graphics::text::renderer::TextRenderer;
 use heapless::String;
-use profont::PROFONT_24_POINT;
+use profont::PROFONT_14_POINT;
 
 pub struct GraphicUtils;
 
@@ -59,6 +59,20 @@ impl GraphicUtils {
     pub fn get_button_size() -> Size {
         Size::new(90, 50)
     }
+    pub fn get_text_with_ellipsis_from_string(width: u32, text: String<256>, font: &MonoFont) -> String<256> {
+        GraphicUtils::get_text_with_ellipsis_from_str(width, text.as_str(), font)
+    }
+    pub fn get_text_with_ellipsis_from_str(width: u32, text: &str, font: &MonoFont) -> String<256> {
+        let text_width = font.character_size.width * text.len() as u32;
+        if text_width > width {
+            let text_len_visible = width / font.character_size.width;
+            let text_visible = text.split_at((text_len_visible - 3) as usize).0;
+            let mut text_visible_str = String::from(text_visible);
+            text_visible_str.push_str("...").unwrap();
+            return text_visible_str;
+        }
+        String::from(text)
+    }
 }
 
 pub trait ListItem {
@@ -77,7 +91,7 @@ pub struct List<T> {
     window_start: usize,
     highlight_color: Rgb565,
     background_color: Rgb565,
-    text_color: Rgb565
+    text_color: Rgb565,
 }
 
 impl<T: ListItem + Clone> List<T> {
@@ -91,7 +105,7 @@ impl<T: ListItem + Clone> List<T> {
             window_start: 0,
             highlight_color: theme.highlight_color,
             background_color: theme.screen_background_color,
-            text_color: theme.text_color_primary
+            text_color: theme.text_color_primary,
         }
     }
 
@@ -107,16 +121,41 @@ impl<T: ListItem + Clone> List<T> {
             .build()
     }
 
+    fn get_scrollbar_style(&self) -> PrimitiveStyle<Rgb565> {
+        PrimitiveStyleBuilder::new()
+            .fill_color(self.highlight_color)
+            .build()
+    }
+
+    fn get_scrollbar_indicator_style(&self) -> PrimitiveStyle<Rgb565> {
+        PrimitiveStyleBuilder::new()
+            .fill_color(self.text_color)
+            .build()
+    }
+
     fn get_character_style<'a>(&self, item: &'a T) -> MonoTextStyle<'a, Rgb565> {
         MonoTextStyle::new(
             item.get_font(),
             self.text_color)
     }
 
+    fn show_scrollbar(&self) -> bool {
+        self.list_items.len() > self.visible_lines
+    }
+
+    fn get_scrollbar_width(&self) -> u32 {
+        20u32
+    }
+
+    fn get_visible_text(&self, item: &T) -> String<256> {
+        let visible_width = self.size.width - self.get_scrollbar_width();
+        GraphicUtils::get_text_with_ellipsis_from_string(visible_width, item.get_text(), item.get_font())
+    }
+
     pub fn draw<D>(&self, display: &mut D) -> Result<(), D::Error>
         where D: DrawTarget<Color=Rgb565> {
         for list_items_index in self.window_start..(self.window_start + self.visible_lines).min(self.list_items.len()) {
-            let text = self.list_items[list_items_index].get_text();
+            let text = self.get_visible_text(&self.list_items[list_items_index]);
             let item_height = self.list_items[list_items_index].get_height();
             let character_style = self.get_character_style(&self.list_items[list_items_index]);
             let text_style = self.list_items[list_items_index].get_text_style();
@@ -126,14 +165,32 @@ impl<T: ListItem + Clone> List<T> {
             }
 
             GraphicUtils::display_text_with_background(display, Point::new(self.pos.x, self.pos.y + ((list_items_index - self.window_start) * item_height as usize) as i32),
-                                                       character_style, text_style, text.as_str(), background_style, self.size.width)?;
+                                                       character_style, text_style, text.as_str(), background_style,
+                                                       if self.show_scrollbar() { self.size.width - self.get_scrollbar_width() } else { self.size.width - 10 })?;
+        }
+        if self.show_scrollbar() {
+            // scrollbar
+            let scrollbar_height_absolute = self.size.height - 10;
+            let scrollbar_pos = Point::new((self.size.width - self.get_scrollbar_width()) as i32, self.pos.y);
+            let scrollbar_size = Size::new(self.get_scrollbar_width(), scrollbar_height_absolute);
+            Rectangle::new(scrollbar_pos, scrollbar_size)
+                .into_styled(self.get_scrollbar_style())
+                .draw(display)?;
+
+            let scrollbar_indicator_height = (scrollbar_height_absolute as f32 / (self.list_items.len() as f32 / self.visible_lines as f32)) as usize;
+            let scrollbar_indicator_start = (scrollbar_height_absolute as f32 * (self.window_start as f32 / self.list_items.len() as f32)) as usize;
+            let scrollbar_indicator_pos = Point::new((self.size.width - self.get_scrollbar_width()) as i32, self.pos.y + scrollbar_indicator_start as i32);
+            let scrollbar_indicator_size = Size::new(self.get_scrollbar_width(), scrollbar_indicator_height as u32);
+            Rectangle::new(scrollbar_indicator_pos, scrollbar_indicator_size)
+                .into_styled(self.get_scrollbar_indicator_style())
+                .draw(display)?;
         }
         Ok(())
     }
 
     pub fn scroll_down<D>(&mut self, display: &mut D) -> Result<(), D::Error>
         where D: DrawTarget<Color=Rgb565> {
-        if self.selected_index < self.list_items.len() {
+        if self.selected_index < self.list_items.len() - 1 {
             self.selected_index += 1
         };
         if self.selected_index > self.window_start + self.visible_lines - 1 {
@@ -200,6 +257,10 @@ impl<'a, T: ImageDrawable<Color=Rgb565>> Button<'a, T> {
         }
     }
 
+    pub fn set_image_drawable(&mut self, image_drawable: &'a T) {
+        self.image = image_drawable;
+    }
+
     pub fn draw<D>(&self, display: &mut D, background_style: PrimitiveStyle<Rgb565>) -> Result<(), D::Error>
         where D: DrawTarget<Color=Rgb565> {
         let visible_pos = Point::new(self.pos.x + 5, self.pos.y + 5);
@@ -214,6 +275,9 @@ impl<'a, T: ImageDrawable<Color=Rgb565>> Button<'a, T> {
         let image = Image::new(self.image, Point::new(visible_pos.x + image_margin_x as i32, visible_pos.y + image_margin_y as i32));
         image.draw(display)
     }
+    pub fn get_bounding_box(&self) -> Rectangle {
+        Rectangle::new(self.pos, self.size)
+    }
 }
 
 pub struct Theme {
@@ -222,4 +286,74 @@ pub struct Theme {
     pub screen_background_color: Rgb565,
     pub text_color_primary: Rgb565,
     pub highlight_color: Rgb565,
+}
+
+pub struct Progress<'a, T> {
+    image_drawable: &'a T,
+    text: String<256>,
+    pos: Point,
+    size: Size,
+    background_color: Rgb565,
+    foreground_color: Rgb565,
+    screen_background_color: Rgb565,
+    character_style: MonoTextStyle<'a, Rgb565>,
+}
+
+impl<'a, T: ImageDrawable<Color=Rgb565>> Progress<'a, T> {
+    pub fn new(image_drawable: &'a T, text: &str, position: Point, size: Size, background_color: Rgb565,
+               character_style: MonoTextStyle<'a, Rgb565>, theme: &Theme) -> Self {
+        Progress {
+            image_drawable,
+            text: String::from(text),
+            pos: position,
+            size,
+            background_color,
+            foreground_color: theme.text_color_primary,
+            screen_background_color: theme.screen_background_color,
+            character_style,
+        }
+    }
+    fn get_background_style(&self) -> PrimitiveStyle<Rgb565> {
+        PrimitiveStyleBuilder::new()
+            .fill_color(self.background_color)
+            .build()
+    }
+    fn get_text_style(&self) -> TextStyle {
+        TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .baseline(Baseline::Top)
+            .build()
+    }
+
+    pub fn update_text<D>(&mut self, display: &mut D, text: &str) -> Result<(), D::Error>
+        where D: DrawTarget<Color=Rgb565> {
+        self.text = String::from(text);
+        self.draw(display)
+    }
+
+    pub fn draw<D>(&self, display: &mut D) -> Result<(), D::Error>
+        where D: DrawTarget<Color=Rgb565> {
+        Rectangle::new(self.pos, self.size)
+            .into_styled(self.get_background_style())
+            .draw(display)?;
+
+        let text_height = self.character_style.font.character_size.height;
+
+        let image_size = self.image_drawable.size();
+        let image_pos_x = self.pos.x + ((self.size.width - image_size.width) / 2) as i32;
+        let image_pos_y = self.pos.y + ((self.size.height - image_size.height) / 2 - text_height) as i32;
+        let image = Image::new(self.image_drawable, Point::new(image_pos_x, image_pos_y));
+        image.draw(display)?;
+
+        let text_pos_x = self.pos.x + (self.size.width / 2) as i32;
+        let text_pos_y = self.pos.y + image_pos_y + image_size.height as i32 + text_height as i32;
+        let text = Text::with_text_style(
+            self.text.as_str(),
+            Point::new(text_pos_x, text_pos_y),
+            self.character_style,
+            self.get_text_style(),
+        );
+        let _ = text.draw(display);
+        Ok(())
+    }
 }

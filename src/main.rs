@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
@@ -26,10 +27,10 @@ use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::Drawable;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
-use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
+use embedded_graphics::mono_font::MonoFont;
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::Primitive;
-use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle};
+use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::{Alignment, Baseline, TextStyle, TextStyleBuilder};
 use embedded_graphics::text::renderer::TextRenderer;
 use embedded_hal_async::digital::Wait;
@@ -53,6 +54,7 @@ use esp32_hal::spi::master::{Instance, Spi};
 use esp32_hal::spi::SpiMode;
 use esp32_utils_crate::dummy_pin::DummyPin;
 use esp32_utils_crate::fonts::CharacterStyles;
+use esp32_utils_crate::sdcard::SdcardManager;
 use esp32_utils_crate::touch_mapper::TouchPosMapper;
 use esp32_utils_crate::tsc2007::{Tsc2007, TSC2007_ADDR};
 use esp32_utils_crate::tsc2007;
@@ -69,10 +71,11 @@ use reqwless::request::Method::GET;
 use reqwless::response::Status;
 use rmp3::{MAX_SAMPLES_PER_FRAME, RawDecoder};
 use rmp3::Frame;
+use serde::{Deserialize, Serialize};
 use static_cell::make_static;
 use static_cell::StaticCell;
 
-use crate::graphics::{Button, GraphicUtils, ListItem, Theme};
+use crate::graphics::{Button, GraphicUtils, ListItem, Progress, Theme};
 
 mod graphics;
 
@@ -132,16 +135,18 @@ const RADIO_STATION_URL_LEN_MAX: usize = 256;
 #[derive(Clone, Debug)]
 struct ControlData {
     url: String<RADIO_STATION_URL_LEN_MAX>,
-    play_pause: bool,
+    play: bool,
+    pause: bool,
     change_url: bool,
 }
 
 impl ControlData {
-    fn new(url: &str, change_url: bool, play_pause: bool) -> Self {
+    fn new(url: &str, change_url: bool, play: bool, pause: bool) -> Self {
         ControlData {
             url: String::from(url),
-            change_url,
-            play_pause,
+            play,
+            pause,
+            change_url
         }
     }
 }
@@ -189,12 +194,37 @@ static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 4> = Channel::
 struct StatusData {
     paused: bool,
     url_index: usize,
+    error: bool
 }
 
-#[derive(Clone, Debug)]
+impl StatusData {
+    fn new(paused: bool, url_index: usize) -> Self {
+        StatusData {
+            paused,
+            url_index,
+            error: false
+        }
+    }
+    fn new_error() -> Self {
+        StatusData {
+            paused: false,
+            url_index: 0,
+            error: true
+        }
+    }
+}
+
+static STATUS_DATA_SIGNAL: Signal<CriticalSectionRawMutex, StatusData> = Signal::new();
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct RadioStation {
     url: String<RADIO_STATION_URL_LEN_MAX>,
     title: String<META_DATA_TITLE_LEN_MAX>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RadioStationList {
+    list: Vec<RadioStation>
 }
 
 impl ListItem for RadioStation {
@@ -278,7 +308,6 @@ async fn connection(mut controller: WifiController<'static>) {
                 ..Default::default()
             });
             controller.set_configuration(&client_config).unwrap();
-            println!("Starting wifi");
             controller.start().await.unwrap();
             println!("Wifi started!");
         }
@@ -328,7 +357,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                 current_url.clear();
                 current_url.push_str(control_data.url.as_str()).unwrap();
             }
-            if control_data.play_pause {
+            if control_data.play {
                 playback_paused = false;
             }
             continue;
@@ -341,8 +370,18 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
         request = request.headers(&headers);
 
         let mut icy_metaint = 0;
-        let response = request.send(&mut rx_buffer).await.unwrap();
+        let response_result = request.send(&mut rx_buffer).await;
+        if response_result.is_err() {
+            println!("error connecting");
+            playback_paused = true;
+
+            STATUS_DATA_SIGNAL.signal(StatusData::new_error());
+            continue;
+        }
+        let response = response_result.unwrap();
         if response.status == Status::Ok {
+            println!("connected to {}", current_url);
+
             for i in response.headers() {
                 let key = i.0;
                 if key.starts_with("icy") {
@@ -358,6 +397,8 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
             if icy_metaint == 0 {
                 println!("no icy stream");
                 playback_paused = true;
+
+                STATUS_DATA_SIGNAL.signal(StatusData::new_error());
                 continue;
             } else {
                 let mut decoder = RawDecoder::new();
@@ -390,6 +431,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                 'outer: loop {
                     if CONTROL_DATA_SIGNAL.signaled() {
                         let control_data = CONTROL_DATA_SIGNAL.wait().await;
+                        println!("outer loop {:?}", control_data);
                         if control_data.change_url {
                             current_url.clear();
                             current_url.push_str(control_data.url.as_str()).unwrap();
@@ -397,7 +439,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                             // send silence before change
                             send_silence().await;
                             break;
-                        } else if control_data.play_pause {
+                        } else if control_data.pause {
                             playback_paused = true;
 
                             // send silence before pause
@@ -411,6 +453,8 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                             if buf.is_empty() {
                                 println!("lost connection");
                                 playback_paused = true;
+
+                                STATUS_DATA_SIGNAL.signal(StatusData::new_error());
 
                                 // send silence before pause
                                 send_silence().await;
@@ -515,9 +559,11 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                 }
             }
         } else {
+            println!("connect response.status {:?}", response.status);
+
             playback_paused = true;
-            // send silence before pause
-            send_silence().await;
+
+            STATUS_DATA_SIGNAL.signal(StatusData::new_error());
         }
     }
 }
@@ -630,6 +676,18 @@ async fn handle_tp_touch_tsc2007(i2c: asynch::i2c::I2cDevice<'static, CriticalSe
     }
 }
 
+fn get_left_button_pos(width: u32, height: u32) -> Point {
+    Point::new(0, (height - GraphicUtils::get_button_size().height) as i32)
+}
+
+fn get_right_button_pos(width: u32, height: u32) -> Point {
+    Point::new((width - GraphicUtils::get_button_size().width) as i32, (height - GraphicUtils::get_button_size().height) as i32)
+}
+
+fn get_middle_button_pos(width: u32, height: u32) -> Point {
+    Point::new((width / 2 - GraphicUtils::get_button_size().width / 2) as i32, (height - GraphicUtils::get_button_size().height) as i32)
+}
+
 fn display_play_navigation<D>(display: &mut D, width: u32, height: u32, status: &StatusData, theme: &Theme) -> Result<(), D::Error>
     where D: DrawTarget<Color=Rgb565> {
     let color = theme.button_foreground_color;
@@ -638,10 +696,10 @@ fn display_play_navigation<D>(display: &mut D, width: u32, height: u32, status: 
     let icon_pause = icons::size24px::music::Pause::new(color);
     let icon_list = icons::size24px::layout::TableRows::new(color);
 
-    let image_next = Button::new(&icon_next, Point::new(0, (height - GraphicUtils::get_button_size().height) as i32));
-    let image_play = Button::new(&icon_play, Point::new((width - GraphicUtils::get_button_size().width) as i32, (height - GraphicUtils::get_button_size().height) as i32));
-    let image_pause = Button::new(&icon_pause, Point::new((width - GraphicUtils::get_button_size().width) as i32, (height - GraphicUtils::get_button_size().height) as i32));
-    let image_list = Button::new(&icon_list, Point::new((width / 2 - GraphicUtils::get_button_size().width / 2) as i32, (height - GraphicUtils::get_button_size().height) as i32));
+    let image_next = Button::new(&icon_next, get_left_button_pos(width, height));
+    let image_play = Button::new(&icon_play, get_right_button_pos(width, height));
+    let image_pause = Button::new(&icon_pause, get_right_button_pos(width, height));
+    let image_list = Button::new(&icon_list, get_middle_button_pos(width, height));
 
     let background_style = PrimitiveStyleBuilder::new()
         .fill_color(theme.button_background_color)
@@ -663,9 +721,9 @@ fn display_list_navigation<D>(display: &mut D, width: u32, height: u32, theme: &
     let icon_down = icons::size24px::navigation::ArrowDown::new(color);
     let icon_select = icons::size24px::music::Play::new(color);
 
-    let image_down = Button::new(&icon_up, Point::new(0, (height - GraphicUtils::get_button_size().height) as i32));
-    let image_up = Button::new(&icon_down, Point::new((width - GraphicUtils::get_button_size().width) as i32, (height - GraphicUtils::get_button_size().height) as i32));
-    let image_select = Button::new(&icon_select, Point::new((width / 2 - GraphicUtils::get_button_size().width / 2) as i32, (height - GraphicUtils::get_button_size().height) as i32));
+    let image_down = Button::new(&icon_up, get_left_button_pos(width, height));
+    let image_up = Button::new(&icon_down, get_right_button_pos(width, height));
+    let image_select = Button::new(&icon_select, get_middle_button_pos(width, height));
 
     let background_style = PrimitiveStyleBuilder::new()
         .fill_color(theme.button_background_color)
@@ -793,17 +851,11 @@ async fn main(spawner: Spawner) {
     let display_width = display.width() as u32;
     let display_height = display.height() as u32;
 
-    let button_width = GraphicUtils::get_button_size().width;
-    let button_height = GraphicUtils::get_button_size().height;
+    let icon_left_area = Rectangle::new(get_left_button_pos(display_width, display_height), GraphicUtils::get_button_size());
+    let icon_right_area = Rectangle::new(get_right_button_pos(display_width, display_height), GraphicUtils::get_button_size());
+    let icon_middle_area = Rectangle::new(get_middle_button_pos(display_width, display_height), GraphicUtils::get_button_size());
 
-    let icon_left_area = Rectangle::new(Point::new(0, (display_height - button_height) as i32), GraphicUtils::get_button_size());
-    let icon_right_area = Rectangle::new(Point::new((display_width - button_width) as i32, (display_height - button_height) as i32), GraphicUtils::get_button_size());
-    let icon_middle_area = Rectangle::new(Point::new((display_width / 2 - button_width / 2) as i32, (display_height - button_height) as i32), GraphicUtils::get_button_size());
-
-    let mut status = StatusData {
-        paused: true,
-        url_index: 0,
-    };
+    let mut status = StatusData::new(false, 0);
 
     let mut meta_data = MetaData {
         title: String::from(""),
@@ -812,28 +864,40 @@ async fn main(spawner: Spawner) {
         sample_rate: 0,
     };
 
-    display.clear_screen(theme.screen_background_color).unwrap();
+    let wifi_icon = icons::size96px::connectivity::Wifi::new(theme.text_color_primary);
+    let mut progress = Progress::new(&wifi_icon, "Connecting to Wifi...",
+                                     Point::new(0, 0), Size::new(display_width, display_height),
+                                     theme.screen_background_color, character_styles.default_character_style(),
+                                     &theme);
 
-    // let sdcard = embedded_sdmmc::sdcard::SdCard::new(sd_spi, sd_cs, Delay);
-    // let mut sdcard_manager = SdcardManager::new(sdcard);
-    //
-    // let mut root_file_list = Vec::new();
-    // if let Ok(()) = sdcard_manager.open_root_dir() {
-    //     match sdcard_manager.get_root_dir_entries(&mut root_file_list) {
-    //         Ok(()) => {}
-    //         Err(e) => println!("{:?}", e)
-    //     }
-    // }
-    // println!("root dir files size = {}", root_file_list.len());
-    // for file in &root_file_list {
-    //     println!("{}", file.name);
-    // }
+    let sdcard = embedded_sdmmc::sdcard::SdCard::new(sd_spi, sd_cs, Delay);
+    let mut sdcard_manager = SdcardManager::new(sdcard);
 
+    let mut root_file_list = Vec::new();
+    if let Ok(()) = sdcard_manager.open_root_dir() {
+        match sdcard_manager.get_root_dir_entries(&mut root_file_list) {
+            Ok(()) => {}
+            Err(e) => println!("{:?}", e)
+        }
+    }
+    let mut station_list: Vec<RadioStation> = Vec::new();
+
+    for file in &root_file_list {
+        if file.name.to_string() == "RADIO.JSO" {
+            let mut buffer_vec = vec![0; file.size as usize];
+            let load_result = sdcard_manager.load_root_dir_file_into_buffer("RADIO.JSO", &mut buffer_vec);
+            if load_result.is_ok() {
+                let mut sd_station_list = serde_json_core::from_slice::<RadioStationList>(buffer_vec.as_slice()).unwrap().0;
+                station_list.append(&mut sd_station_list.list);
+            }
+        }
+    }
+
+    progress.update_text(&mut display, "Connecting to Wifi...").unwrap();
 
     let wifi = peripherals.WIFI;
     let (wifi_interface, controller) =
         esp_wifi::wifi::new_with_mode(&_init, wifi, WifiStaDevice).unwrap();
-
 
     let config = Config::dhcpv4(Default::default());
 
@@ -846,10 +910,10 @@ async fn main(spawner: Spawner) {
     );
     let stack = make_static!(net_stack);
 
+    // TODO connection can throw errors - how to show in progress?
     spawner.must_spawn(connection(controller));
     spawner.must_spawn(net_task(stack));
 
-    println!("Connecting to Wifi...");
     loop {
         if stack.is_link_up() {
             break;
@@ -857,7 +921,8 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(500)).await;
     }
 
-    println!("Waiting to get IP address...");
+    progress.update_text(&mut display, "Waiting for IP address...").unwrap();
+
     loop {
         if let Some(config) = stack.config_v4() {
             println!("Got IP: {}", config.address);
@@ -866,13 +931,14 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(500)).await;
     }
 
+    display.clear_screen(theme.screen_background_color).unwrap();
+
     let dma = Dma::new(system.dma);
     let dma_channel = dma.i2s0channel;
 
     // from dma_buffers macro
     let tx_descriptors = make_static!([DmaDescriptor::EMPTY; (I2S_BUFFER_SIZE + 4091) / 4092]);
     let rx_descriptors = make_static!([DmaDescriptor::EMPTY; (I2S_BUFFER_SIZE + 4091) / 4092]);
-    // let tx_buffer = make_static!([0u8; I2S_BUFFER_SIZE]);
 
     let i2s = I2s::new(
         peripherals.I2S0,
@@ -888,35 +954,17 @@ async fn main(spawner: Spawner) {
         clocks,
     );
 
-    // let mut i2s_tx = i2s
-    //     .i2s_tx
-    //     .with_bclk(io.pins.gpio26)
-    //     .with_ws(io.pins.gpio25)
-    //     .with_dout(io.pins.gpio12)
-    //     .build();
-    //
-    // let mut transaction = i2s_tx.write_dma_circular_async(tx_buffer).unwrap();
-
-    let mut station_list: Vec<RadioStation> = Vec::new();
-    station_list.push(RadioStation::new("FM4", "http://orf-live.ors-shoutcast.at/fm4-q2a"));
-    station_list.push(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
-    station_list.push(RadioStation::new("Terry Callaghan's Classic Alternative Channel", "http://s16.myradiostream.com:7304"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-    station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    if station_list.len() == 0 {
+        station_list.push(RadioStation::new("FM4", "http://orf-live.ors-shoutcast.at/fm4-q2a"));
+        station_list.push(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
+        station_list.push(RadioStation::new("Terry Callaghan's Classic Alternative Channel", "http://s16.myradiostream.com:7304"));
+        station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    }
 
     let mut current_screen = 0;
 
     let mut select_list = graphics::List::new(&station_list, Point::new(10, 10),
-                                              Size::new(display_width - 20, (display_height - GraphicUtils::get_button_size().height)),
+                                              Size::new(display_width - 10, (display_height - GraphicUtils::get_button_size().height)),
                                               &theme);
     select_list.draw(&mut display).unwrap();
     display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
@@ -964,23 +1012,27 @@ async fn main(spawner: Spawner) {
                 let split_pos = title.find(" - ").unwrap_or(0);
                 if split_pos != 0 {
                     let (artist, track) = title.split_at(split_pos);
-                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.default_character_style(),
-                                                               character_styles.default_text_style(), artist,
+                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.medium_character_style(),
+                                                               character_styles.default_text_style(),
+                                                               GraphicUtils::get_text_with_ellipsis_from_str(display_width, artist, character_styles.medium_character_style().font).as_str(),
                                                                clear_style, display_width).unwrap();
-                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 60), character_styles.default_character_style(),
-                                                               character_styles.default_text_style(), track.strip_prefix(" - ").unwrap_or(track),
+                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 60), character_styles.medium_character_style(),
+                                                               character_styles.default_text_style(),
+                                                               GraphicUtils::get_text_with_ellipsis_from_str(display_width, track.strip_prefix(" - ").unwrap_or(track), character_styles.medium_character_style().font).as_str(),
                                                                clear_style, display_width).unwrap();
                 } else {
-                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.default_character_style(),
-                                                               character_styles.default_text_style(), title,
+                    GraphicUtils::display_text_with_background(&mut display, Point::new(10, 40), character_styles.medium_character_style(),
+                                                               character_styles.default_text_style(),
+                                                               GraphicUtils::get_text_with_ellipsis_from_str(display_width, title, character_styles.medium_character_style().font).as_str(),
                                                                clear_style, display_width).unwrap();
                 }
 
                 buf.clear();
                 write!(buf, "{} / {} / {}", meta_data.sample_rate, meta_data.channels, meta_data.bitrate).unwrap();
 
-                GraphicUtils::display_text_with_background(&mut display, Point::new(10, 80), character_styles.default_character_style(),
-                                                           character_styles.default_text_style(), buf.as_str(),
+                GraphicUtils::display_text_with_background(&mut display, Point::new(10, 80), character_styles.medium_character_style(),
+                                                           character_styles.default_text_style(),
+                                                           buf.as_str(),
                                                            clear_style, display_width).unwrap();
             }
             if meta_data.sample_rate != 0 {
@@ -1017,7 +1069,7 @@ async fn main(spawner: Spawner) {
                     status.url_index = (status.url_index + 1) % station_list.len();
                     select_list.set_selected_index(status.url_index);
                     println!("control change_url");
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, false));
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, true, false));
                 }
             }
             if icon_right_area.contains(touch_point) {
@@ -1026,7 +1078,7 @@ async fn main(spawner: Spawner) {
                 } else if current_screen == 1 {
                     println!("control play_pause");
                     status.paused = !status.paused;
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new("", false, true));
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new("", false, !status.paused, status.paused));
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 }
             }
@@ -1034,10 +1086,8 @@ async fn main(spawner: Spawner) {
                 if current_screen == 0 {
                     current_screen = 1;
                     status.url_index = select_list.get_selected_index();
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, if status.paused { true } else { false }));
-                    if status.paused {
-                        status.paused = false;
-                    }
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, true, false));
+                    status.paused = false;
                     display.clear_screen(theme.screen_background_color).unwrap();
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 } else if current_screen == 1 {
@@ -1049,20 +1099,27 @@ async fn main(spawner: Spawner) {
             }
             if select_list.get_bounding_box().contains(touch_point) {
                 if let Ok(selected_index) = select_list.select_at_pos(&mut display, touch_point) {
-                    if selected_index != status.url_index {
+                    // if selected_index != status.url_index {
                         current_screen = 1;
                         status.url_index = selected_index;
-                        CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, if status.paused { true } else { false }));
-                        if status.paused {
-                            status.paused = false;
-                        }
+                        CONTROL_DATA_SIGNAL.signal(ControlData::new(&station_list[status.url_index].url, true, true, false));
+                        status.paused = false;
                         display.clear_screen(theme.screen_background_color).unwrap();
                         display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
-                    }
+                    // }
                 }
             }
         }
-
+        if STATUS_DATA_SIGNAL.signaled() {
+            let error_status = STATUS_DATA_SIGNAL.wait().await;
+            if error_status.error {
+                // TODO show error string
+                status.paused = true;
+                if current_screen == 1 {
+                    display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
+                }
+            }
+        }
 
         // let frame_data = FRAME_CHANNEL.receive().await;
         // let mut frame_index = 0;
