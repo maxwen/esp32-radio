@@ -11,7 +11,6 @@ use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Recta
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder};
 use embedded_graphics::text::renderer::TextRenderer;
 use heapless::String;
-use profont::PROFONT_14_POINT;
 
 pub struct GraphicUtils;
 
@@ -296,7 +295,6 @@ pub struct Progress<'a, T> {
     size: Size,
     background_color: Rgb565,
     foreground_color: Rgb565,
-    screen_background_color: Rgb565,
     character_style: MonoTextStyle<'a, Rgb565>,
 }
 
@@ -310,7 +308,6 @@ impl<'a, T: ImageDrawable<Color=Rgb565>> Progress<'a, T> {
             size,
             background_color,
             foreground_color: theme.text_color_primary,
-            screen_background_color: theme.screen_background_color,
             character_style,
         }
     }
@@ -356,5 +353,53 @@ impl<'a, T: ImageDrawable<Color=Rgb565>> Progress<'a, T> {
         );
         let _ = text.draw(display);
         Ok(())
+    }
+}
+
+pub struct Label<'a> {
+    text: String<256>,
+    pos: Point,
+    width: u32,
+    background_color: Rgb565,
+    foreground_color: Rgb565,
+    character_style: MonoTextStyle<'a, Rgb565>,
+}
+
+impl<'a> Label<'a> {
+    pub fn new(text: &str, position: Point, width: u32, background_color: Rgb565,
+               character_style: MonoTextStyle<'a, Rgb565>, theme: &Theme) -> Self {
+        Label {
+            text: String::from(text),
+            pos: position,
+            width,
+            background_color,
+            foreground_color: theme.text_color_primary,
+            character_style,
+        }
+    }
+    fn get_background_style(&self) -> PrimitiveStyle<Rgb565> {
+        PrimitiveStyleBuilder::new()
+            .fill_color(self.background_color)
+            .build()
+    }
+
+    fn get_text_style(&self) -> TextStyle {
+        TextStyleBuilder::new()
+            .alignment(Alignment::Left)
+            .baseline(Baseline::Top)
+            .build()
+    }
+    pub fn draw<D>(&self, display: &mut D) -> Result<Point, D::Error>
+        where D: DrawTarget<Color=Rgb565> {
+        GraphicUtils::display_text_with_background(display, self.pos, self.character_style,
+                                                   self.get_text_style(),
+                                                   GraphicUtils::get_text_with_ellipsis_from_str(self.width, self.text.as_str(), self.character_style.font).as_str(),
+                                                   self.get_background_style(), self.width)
+    }
+
+    pub fn update_text<D>(&mut self, display: &mut D, text: &str) -> Result<Point, D::Error>
+        where D: DrawTarget<Color=Rgb565> {
+        self.text = String::from(text);
+        self.draw(display)
     }
 }

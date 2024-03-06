@@ -77,9 +77,12 @@ use static_cell::make_static;
 use static_cell::StaticCell;
 
 use crate::Error::NoError;
-use crate::graphics::{Button, GraphicUtils, ListItem, Progress, Theme};
+use crate::ft6236_asynch::EventType::PressDown;
+use crate::ft6236_asynch::FT6236;
+use crate::graphics::{Button, GraphicUtils, Label, ListItem, Progress, Theme};
 
 mod graphics;
+mod ft6236_asynch;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
@@ -494,12 +497,14 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                         let control_data = CONTROL_DATA_SIGNAL.wait().await;
                         println!("outer loop {:?}", control_data);
                         if control_data.change_url {
-                            current_url.clear();
-                            current_url.push_str(control_data.url.as_str()).unwrap();
+                            if current_url != control_data.url {
+                                current_url.clear();
+                                current_url.push_str(control_data.url.as_str()).unwrap();
 
-                            // send silence before change
-                            send_silence().await;
-                            break;
+                                // send silence before change
+                                send_silence().await;
+                                break;
+                            }
                         } else if control_data.pause {
                             playback_paused = true;
 
@@ -739,6 +744,38 @@ async fn handle_tp_touch_tsc2007(i2c: asynch::i2c::I2cDevice<'static, CriticalSe
     }
 }
 
+#[embassy_executor::task]
+async fn handle_tp_touch_ft6206(i2c: asynch::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0>>, tp_irq_pin: GpioPin<Unknown, 32>,
+                                orientation: Orientation, width: u16, height: u16) {
+    let mut ft6206 = FT6236::new(i2c);
+    let mut tp_irq_input = tp_irq_pin.into_pull_down_input();
+
+    loop {
+        tp_irq_input.wait_for_low().await.unwrap();
+        if let Ok(point) = ft6206.get_point0().await {
+            if point.is_some() {
+                let point_event = point.unwrap();
+                let x = point_event.x;
+                let y = point_event.y;
+                let z = point_event.weight;
+                if point_event.event == PressDown {
+                    // println!("{:?}", point_event);
+                    let (x, y) = match orientation {
+                        Orientation::Portrait => (width - x, height - y),
+                        Orientation::Landscape => (width - y, x),
+                        Orientation::PortraitFlipped => (x, y),
+                        Orientation::LandscapeFlipped => (y, height - x)
+                    };
+
+                    TOUCH_DATA_SIGNAL.signal(TouchData::new(x, y, z.into()));
+                    // debounce
+                    Timer::after(Duration::from_millis(100)).await
+                }
+            }
+        }
+    }
+}
+
 fn get_left_button_pos(width: u32, height: u32) -> Point {
     Point::new(0, (height - GraphicUtils::get_button_size().height) as i32)
 }
@@ -943,16 +980,16 @@ async fn main(spawner: Spawner) {
     }
     let mut station_list: Vec<RadioStation> = Vec::new();
 
-    // for file in &root_file_list {
-    //     if file.name.to_string() == "RADIO.JSO" {
-    //         let mut buffer_vec = vec![0; file.size as usize];
-    //         let load_result = sdcard_manager.load_root_dir_file_into_buffer("RADIO.JSO", &mut buffer_vec);
-    //         if load_result.is_ok() {
-    //             let mut sd_station_list = serde_json_core::from_slice::<RadioStationList>(buffer_vec.as_slice()).unwrap().0;
-    //             station_list.append(&mut sd_station_list.list);
-    //         }
-    //     }
-    // }
+    for file in &root_file_list {
+        if file.name.to_string() == "RADIO.JSO" {
+            let mut buffer_vec = vec![0; file.size as usize];
+            let load_result = sdcard_manager.load_root_dir_file_into_buffer("RADIO.JSO", &mut buffer_vec);
+            if load_result.is_ok() {
+                let mut sd_station_list = serde_json_core::from_slice::<RadioStationList>(buffer_vec.as_slice()).unwrap().0;
+                station_list.append(&mut sd_station_list.list);
+            }
+        }
+    }
 
     progress.update_text(&mut display, "Connecting to Wifi...").unwrap();
 
@@ -1020,7 +1057,6 @@ async fn main(spawner: Spawner) {
         station_list.push(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
         station_list.push(RadioStation::new("Terry Callaghan's Classic Alternative Channel", "http://s16.myradiostream.com:7304"));
         station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
-        station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
     }
 
     let mut current_screen = 0;
@@ -1035,8 +1071,11 @@ async fn main(spawner: Spawner) {
 
     spawner.must_spawn(handle_radio_stream(stack, default_url));
     spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
+
     if has_tsc2007 {
         spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display_width as u16, display_height as u16));
+    } else {
+        spawner.must_spawn(handle_tp_touch_ft6206(i2c0_dev1, io.pins.gpio32, display_orientation, display_width as u16, display_height as u16));
     }
 
     // let mut file_written = 0;
@@ -1066,6 +1105,13 @@ async fn main(spawner: Spawner) {
     let meta_second_line_pos = Point::new(10, 60);
     let format_line_pos = Point::new(10, 80);
     let error_line_pos = Point::new(10, 120);
+
+    let mut title_label = Label::new(" ", title_line_pos, display_width, theme.screen_background_color, character_styles.large_character_style(), &theme);
+    let mut meta_first_label = Label::new(" ", meta_first_line_pos, display_width, theme.screen_background_color, character_styles.medium_character_style(), &theme);
+    let mut meta_second_label = Label::new(" ", meta_second_line_pos, display_width, theme.screen_background_color, character_styles.medium_character_style(), &theme);
+    let mut format_label = Label::new(" ", format_line_pos, display_width, theme.screen_background_color, character_styles.medium_character_style(), &theme);
+    let mut error_label = Label::new(" ", error_line_pos, display_width, theme.screen_background_color, error_character_style, &theme);
+
     loop {
         if META_DATA_SIGNAL.signaled() {
             meta_data = META_DATA_SIGNAL.wait().await;
@@ -1074,14 +1120,9 @@ async fn main(spawner: Spawner) {
                 display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
 
                 // clear error
-                GraphicUtils::display_text_with_background(&mut display, error_line_pos, error_character_style,
-                                                           character_styles.default_text_style(),
-                                                           GraphicUtils::get_text_with_ellipsis_from_str(display_width, " ", character_styles.medium_character_style().font).as_str(),
-                                                           clear_style, display_width).unwrap();
+                error_label.update_text(&mut display, " ").unwrap();
 
-                GraphicUtils::display_text_with_background(&mut display, title_line_pos, character_styles.large_character_style(),
-                                                           character_styles.default_text_style(), station_list[status.url_index].title.as_str(),
-                                                           clear_style, display_width).unwrap();
+                title_label.update_text(&mut display, station_list[status.url_index].title.as_str()).unwrap();
 
                 let mut buf: String<META_DATA_TITLE_LEN_MAX> = String::new();
 
@@ -1091,28 +1132,19 @@ async fn main(spawner: Spawner) {
                 let split_pos = title.find(" - ").unwrap_or(0);
                 if split_pos != 0 {
                     let (artist, track) = title.split_at(split_pos);
-                    GraphicUtils::display_text_with_background(&mut display, meta_first_line_pos, character_styles.medium_character_style(),
-                                                               character_styles.default_text_style(),
-                                                               GraphicUtils::get_text_with_ellipsis_from_str(display_width, artist, character_styles.medium_character_style().font).as_str(),
-                                                               clear_style, display_width).unwrap();
-                    GraphicUtils::display_text_with_background(&mut display, meta_second_line_pos, character_styles.medium_character_style(),
-                                                               character_styles.default_text_style(),
-                                                               GraphicUtils::get_text_with_ellipsis_from_str(display_width, track.strip_prefix(" - ").unwrap_or(track), character_styles.medium_character_style().font).as_str(),
-                                                               clear_style, display_width).unwrap();
+                    meta_first_label.update_text(&mut display, artist).unwrap();
+                    meta_second_label.update_text(&mut display, track.strip_prefix(" - ").unwrap_or(track)).unwrap();
                 } else {
-                    GraphicUtils::display_text_with_background(&mut display, meta_first_line_pos, character_styles.medium_character_style(),
-                                                               character_styles.default_text_style(),
-                                                               GraphicUtils::get_text_with_ellipsis_from_str(display_width, title, character_styles.medium_character_style().font).as_str(),
-                                                               clear_style, display_width).unwrap();
+                    meta_first_label.update_text(&mut display, title).unwrap();
+                    meta_second_label.update_text(&mut display, " ").unwrap();
                 }
-
-                buf.clear();
-                write!(buf, "{} / {} / {}", meta_data.sample_rate, meta_data.channels, meta_data.bitrate).unwrap();
-
-                GraphicUtils::display_text_with_background(&mut display, format_line_pos, character_styles.medium_character_style(),
-                                                           character_styles.default_text_style(),
-                                                           buf.as_str(),
-                                                           clear_style, display_width).unwrap();
+                if meta_data.sample_rate != 0 {
+                    buf.clear();
+                    write!(buf, "{} / {} / {}", meta_data.sample_rate, meta_data.channels, meta_data.bitrate).unwrap();
+                    format_label.update_text(&mut display, buf.as_str()).unwrap();
+                } else {
+                    format_label.update_text(&mut display, " ").unwrap();
+                }
             }
             if meta_data.sample_rate != 0 {
                 if meta_data.sample_rate != current_sample_rate {
@@ -1171,6 +1203,8 @@ async fn main(spawner: Spawner) {
                 if current_screen == 0 {
                     current_screen = 1;
                     display.clear_screen(theme.screen_background_color).unwrap();
+                    // show current meta data
+                    META_DATA_SIGNAL.signal(meta_data.clone());
 
                     let url_index_new = select_list.get_selected_index();
                     status.set_playing(url_index_new);
@@ -1189,6 +1223,8 @@ async fn main(spawner: Spawner) {
                 if let Ok(selected_index) = select_list.select_at_pos(&mut display, touch_point) {
                     current_screen = 1;
                     display.clear_screen(theme.screen_background_color).unwrap();
+                    // show current meta data
+                    META_DATA_SIGNAL.signal(meta_data.clone());
 
                     status.set_playing(selected_index);
                     CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[selected_index].url));
@@ -1202,14 +1238,8 @@ async fn main(spawner: Spawner) {
             if error_status.error {
                 status.set_paused();
                 if current_screen == 1 {
+                    error_label.update_text(&mut display, get_error_description(error_status.error_type)).unwrap();
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
-
-                    GraphicUtils::display_text_with_background(&mut display, error_line_pos, error_character_style,
-                                                               character_styles.default_text_style(),
-                                                               GraphicUtils::get_text_with_ellipsis_from_str(display_width,
-                                                                                                             get_error_description(error_status.error_type),
-                                                                                                             character_styles.medium_character_style().font).as_str(),
-                                                               clear_style, display_width).unwrap();
                 }
             }
         }
