@@ -1883,7 +1883,6 @@ dependencies = [
 [[package]]
 name = "rmp3"
 version = "0.3.1"
-source = "git+https://github.com/maxwen/rmp3#30ee8e1fd5173ec211aa6e84b3ad599a6bc383f2"
 dependencies = [
  "cc",
  "libc",

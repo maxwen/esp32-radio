@@ -29,7 +29,7 @@ embedded-hal-bus = { version = "0.1.0", features = ["async"] }
 embedded-hal-async = "1.0.0"
 embedded-sdmmc = { version = "0.7.0" }
 reqwless = { version = "0.11.0", features = ["alloc"] }
-rmp3 = {  version = "0.3", default-features = false, features = ["simd"] }
+rmp3 = { version = "0.3", default-features = false }
 profont = "0.7.0"
 eg-seven-segment = "0.2.0"
 esp32-utils-crate = { path = "../esp32-utils-crate" }
@@ -46,5 +46,6 @@ opt-level = 3
 [patch.crates-io]
 esp-hal-common = { git = "https://github.com/maxwen/esp-hal", branch = "0.15.0" }
 reqwless = { path = "/home/maxl/esp32/rust/reqwless" }
-rmp3 = { git = "https://github.com/maxwen/rmp3" }
+rmp3 = { path = "../rmp3" }
 ili9341 = { git = "https://github.com/maxwen/ili9341-rs" }
+#embassy-sync = { path = "/home/maxl/esp32/rust/embassy/embassy-sync" }
