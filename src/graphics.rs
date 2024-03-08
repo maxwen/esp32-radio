@@ -58,24 +58,24 @@ impl GraphicUtils {
     pub fn get_button_size() -> Size {
         Size::new(90, 50)
     }
-    pub fn get_text_with_ellipsis_from_string(width: u32, text: String<256>, font: &MonoFont) -> String<256> {
-        GraphicUtils::get_text_with_ellipsis_from_str(width, text.as_str(), font)
+    pub fn get_text_with_ellipsis_from_string(width: u32, text: &str, font: &MonoFont) -> alloc::string::String {
+        GraphicUtils::get_text_with_ellipsis_from_str(width, text, font)
     }
-    pub fn get_text_with_ellipsis_from_str(width: u32, text: &str, font: &MonoFont) -> String<256> {
+    pub fn get_text_with_ellipsis_from_str(width: u32, text: &str, font: &MonoFont) -> alloc::string::String {
         let text_width = font.character_size.width * text.len() as u32;
         if text_width > width {
             let text_len_visible = width / font.character_size.width;
             let text_visible = text.split_at((text_len_visible - 3) as usize).0;
-            let mut text_visible_str = String::from(text_visible);
-            text_visible_str.push_str("...").unwrap();
+            let mut text_visible_str = alloc::string::String::from(text_visible);
+            text_visible_str.push_str("...");
             return text_visible_str;
         }
-        String::from(text)
+        alloc::string::String::from(text)
     }
 }
 
 pub trait ListItem {
-    fn get_text(&self) -> String<256>;
+    fn get_text(&self) -> &str;
     fn get_height(&self) -> u16;
     fn get_font(&self) -> &MonoFont<'_>;
     fn get_text_style(&self) -> TextStyle;
@@ -100,7 +100,7 @@ impl<T: ListItem + Clone> List<T> {
             pos,
             size,
             selected_index: 0,
-            visible_lines: (size.height as u16 / items.first().unwrap().get_height()) as usize,
+            visible_lines: if items.len() == 0 { 1 } else { (size.height as u16 / items.first().unwrap().get_height()) as usize },
             window_start: 0,
             highlight_color: theme.highlight_color,
             background_color: theme.screen_background_color,
@@ -146,7 +146,7 @@ impl<T: ListItem + Clone> List<T> {
         20u32
     }
 
-    fn get_visible_text(&self, item: &T) -> String<256> {
+    fn get_visible_text(&self, item: &T) -> alloc::string::String {
         let visible_width = self.size.width - self.get_scrollbar_width();
         GraphicUtils::get_text_with_ellipsis_from_string(visible_width, item.get_text(), item.get_font())
     }

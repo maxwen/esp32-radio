@@ -4,7 +4,7 @@
 
 extern crate alloc;
 
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
@@ -27,31 +27,34 @@ use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::Drawable;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
+use embedded_graphics::iterator::PixelIteratorExt;
 use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::Primitive;
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::{Alignment, Baseline, TextStyle, TextStyleBuilder};
 use embedded_graphics::text::renderer::TextRenderer;
+use embedded_hal::spi::SpiDevice;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::i2c::I2c;
 use embedded_iconoir::icons;
 use embedded_iconoir::prelude::IconoirNewIcon;
+use embedded_sdmmc::{DirEntry, SdCard};
 use embedded_svc::io::asynch::BufRead;
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp32_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
 use esp32_hal::{Rng, timer::TimerGroup};
 use esp32_hal::clock::Clocks;
 use esp32_hal::dma::{DmaDescriptor, DmaPriority};
-use esp32_hal::gpio::{GpioPin, NO_PIN, Unknown};
+use esp32_hal::gpio::{GpioPin, NO_PIN, Output, PushPull, Unknown};
 use esp32_hal::i2c::I2C;
 use esp32_hal::i2s::{DataFormat, I2s, Standard};
 use esp32_hal::i2s::asynch::I2sWriteDmaAsync;
 use esp32_hal::ledc::{channel, HighSpeed, LEDC, timer};
 use esp32_hal::pdma::{Dma, I2s0DmaChannel};
-use esp32_hal::peripherals::{I2C0, I2S0};
+use esp32_hal::peripherals::{I2C0, I2S0, SPI2};
+use esp32_hal::spi::{FullDuplexMode, SpiMode};
 use esp32_hal::spi::master::{Instance, Spi};
-use esp32_hal::spi::SpiMode;
 use esp32_utils_crate::dummy_pin::DummyPin;
 use esp32_utils_crate::fonts::CharacterStyles;
 use esp32_utils_crate::sdcard::SdcardManager;
@@ -62,7 +65,6 @@ use esp_backtrace;
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize};
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
-use heapless::String;
 use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 use profont::PROFONT_24_POINT;
 use reqwless::client::HttpClient;
@@ -99,20 +101,21 @@ const PASSWORD: &str = env!("PASSWORD");
 // in psram
 const STREAM_BUFFER_SIZE: usize = 1024 * 32;
 const STREAM_BUFFER_SIZE_MIN: usize = 1024 * 16;
-const STREAM_BUFFER_REFILL_TIMEOUT: u64 = 5000; // in micros
+const STREAM_BUFFER_REFILL_TIMEOUT: u64 = 5000;
+// in micros
 const RX_BUFFER_SIZE: usize = 1024 * 4;
 
 const MAX_SAMPLES_PER_FRAME_BYTE: usize = MAX_SAMPLES_PER_FRAME * 2;
 
-const I2S_BUFFER_SIZE: usize = 32000;
-
-const META_DATA_TITLE_LEN_MAX: usize = 256;
+const I2S_BUFFER_SIZE: usize = 1024 * 16;
 
 const SILENCE_DELAY_FRAMES: u64 = 128;
 
+const SILENCE_SHORT_DELAY_FRAMES: u64 = 32;
+
 #[derive(Debug, Clone)]
 struct MetaData {
-    title: String<META_DATA_TITLE_LEN_MAX>,
+    title: alloc::string::String,
     channels: u16,
     sample_rate: u32,
     bitrate: u32,
@@ -137,11 +140,9 @@ static SEND_STATS_DATA_SIGNAL: Signal<CriticalSectionRawMutex, StatsData> = Sign
 static RECEIVE_STATS_DATA_SIGNAL: Signal<CriticalSectionRawMutex, StatsData> = Signal::new();
 
 
-const RADIO_STATION_URL_LEN_MAX: usize = 256;
-
 #[derive(Clone, Debug)]
 struct ControlData {
-    url: String<RADIO_STATION_URL_LEN_MAX>,
+    url: alloc::string::String,
     play: bool,
     pause: bool,
     change_url: bool,
@@ -212,7 +213,7 @@ impl FrameData {
     }
 }
 
-static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 6> = Channel::new();
+static FRAME_CHANNEL: Channel<CriticalSectionRawMutex, FrameData, 4> = Channel::new();
 
 #[derive(Clone, Debug)]
 enum Error {
@@ -239,6 +240,7 @@ struct StatusData {
     url_index: usize,
     error: bool,
     error_type: Error,
+    finished: bool,
 }
 
 impl StatusData {
@@ -248,6 +250,7 @@ impl StatusData {
             url_index: 0,
             error: false,
             error_type: NoError,
+            finished: false,
         }
     }
 
@@ -257,9 +260,19 @@ impl StatusData {
             url_index: 0,
             error: true,
             error_type,
+            finished: false,
         }
     }
 
+    fn new_finished() -> Self {
+        StatusData {
+            paused: false,
+            url_index: 0,
+            error: false,
+            error_type: NoError,
+            finished: true,
+        }
+    }
     fn set_paused(&mut self) {
         self.paused = true;
     }
@@ -278,8 +291,8 @@ static STATUS_DATA_SIGNAL: Signal<CriticalSectionRawMutex, StatusData> = Signal:
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RadioStation {
-    url: String<RADIO_STATION_URL_LEN_MAX>,
-    title: String<META_DATA_TITLE_LEN_MAX>,
+    url: alloc::string::String,
+    title: alloc::string::String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -288,8 +301,8 @@ struct RadioStationList {
 }
 
 impl ListItem for RadioStation {
-    fn get_text(&self) -> String<256> {
-        String::from(self.title.as_str())
+    fn get_text(&self) -> &str {
+        self.title.as_str()
     }
 
     fn get_height(&self) -> u16 {
@@ -313,6 +326,40 @@ impl RadioStation {
         RadioStation {
             url: String::from(url),
             title: String::from(title),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MP3File {
+    file_name: alloc::string::String,
+}
+
+impl ListItem for MP3File {
+    fn get_text(&self) -> &str {
+        self.file_name.as_str()
+    }
+
+    fn get_height(&self) -> u16 {
+        self.get_font().character_size.height as u16
+    }
+
+    fn get_font(&self) -> &MonoFont<'_> {
+        &PROFONT_24_POINT
+    }
+
+    fn get_text_style(&self) -> TextStyle {
+        TextStyleBuilder::new()
+            .alignment(Alignment::Left)
+            .baseline(Baseline::Top)
+            .build()
+    }
+}
+
+impl MP3File {
+    fn new(name: &str) -> Self {
+        MP3File {
+            file_name: String::from(name),
         }
     }
 }
@@ -384,16 +431,25 @@ async fn connection(mut controller: WifiController<'static>) {
     }
 }
 
-async fn send_silence() {
+async fn send_custom_silence(short: bool) {
     let empty_frame_data = FrameData::new();
-    for x in 0..SILENCE_DELAY_FRAMES {
+    let duration = if short { SILENCE_SHORT_DELAY_FRAMES } else { SILENCE_DELAY_FRAMES };
+    for x in 0..duration {
         FRAME_CHANNEL.send(empty_frame_data).await;
     }
 }
 
+async fn send_silence() {
+    send_custom_silence(false).await;
+}
+
+async fn send_short_silence() {
+    send_custom_silence(true).await;
+}
+
 #[embassy_executor::task]
-pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>, default_url: &'static str) {
-    let mut current_url: String<RADIO_STATION_URL_LEN_MAX> = String::from(default_url);
+pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
+    let mut current_url = alloc::string::String::new();
     let mut playback_paused = true;
 
     // let mut tls_read_buffer = [0; 4096];
@@ -408,6 +464,8 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
     let rx_buffer_ptr = unsafe { ALLOCATOR.alloc(rx_buffer_layout) };
     let rx_buffer = unsafe { core::slice::from_raw_parts_mut(rx_buffer_ptr, rx_buffer_layout.size()) };
 
+    let mut frame_data = FrameData::new();
+
     let client_state = TcpClientState::<1, 4096, 4096>::new();
     let tcp_client = TcpClient::new(&stack, &client_state);
     let dns = DnsSocket::new(&stack);
@@ -420,7 +478,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
             let control_data = CONTROL_DATA_SIGNAL.wait().await;
             if control_data.change_url {
                 current_url.clear();
-                current_url.push_str(control_data.url.as_str()).unwrap();
+                current_url.push_str(&control_data.url);
             }
             if control_data.play {
                 playback_paused = false;
@@ -429,7 +487,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
         }
         println!("connecting to {}", current_url);
 
-        let url: String<RADIO_STATION_URL_LEN_MAX> = String::from(current_url.as_str());
+        let url = alloc::string::String::from(current_url.as_str());
         let mut request = http_client.request(GET, url.as_str()).await.unwrap();
         let headers = [("Icy-MetaData", "1")];
         request = request.headers(&headers);
@@ -487,7 +545,6 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                     channels: 0,
                     sample_rate: 0,
                 };
-                let mut frame_data = FrameData::new();
                 let mut stats_data = StatsData {
                     stream_bytes_per_sec: 0,
                     send_bytes_per_sec: 0,
@@ -508,7 +565,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                         if control_data.change_url {
                             if current_url != control_data.url {
                                 current_url.clear();
-                                current_url.push_str(control_data.url.as_str()).unwrap();
+                                current_url.push_str(&control_data.url);
 
                                 // send silence before change
                                 send_silence().await;
@@ -557,11 +614,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                                     }
                                     in_meta_data_index = in_meta_data_index + 1;
                                     if in_meta_data_index == meta_data_len {
-                                        let meta_data_str = unsafe {
-                                            if current_meta.len() > META_DATA_TITLE_LEN_MAX {
-                                                from_utf8_unchecked(&current_meta.as_slice()[..META_DATA_TITLE_LEN_MAX])
-                                            } else { from_utf8_unchecked(&current_meta.as_slice()) }
-                                        };
+                                        let meta_data_str = unsafe { from_utf8_unchecked(&current_meta.as_slice()) };
 
                                         meta_data.title = String::from(meta_data_str);
                                         META_DATA_SIGNAL.signal(meta_data.clone());
@@ -577,8 +630,8 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                                     // use max delay and not only full buffer
                                     if data_buffer_index == STREAM_BUFFER_SIZE ||
                                         (data_buffer_index > STREAM_BUFFER_SIZE_MIN && buffer_refill_start.elapsed().as_micros() > STREAM_BUFFER_REFILL_TIMEOUT) {
-                                        // cant handle 320 so just shut up
-                                        if meta_data.bitrate != 0 && meta_data.bitrate > 256 {
+                                        // cant handle  so just shut up
+                                        if meta_data.bitrate != 0 && meta_data.bitrate > 192 {
                                             println!("mp3 decoder error");
                                             playback_paused = true;
 
@@ -589,7 +642,8 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                                             break 'outer;
                                         } else {
                                             let mut consumed = 0;
-                                            while let Some((frame, bytes_consumed)) = decoder.next(&data_buffer[consumed..], &mut frame_data.data) {
+                                            let mut decoded_frames = 0;
+                                            while let Some((frame, bytes_consumed)) = decoder.next(&data_buffer[consumed..data_buffer_index], &mut frame_data.data) {
                                                 consumed += bytes_consumed;
                                                 if let Frame::Audio(audio) = frame {
                                                     if meta_data.is_incomplete() {
@@ -605,7 +659,10 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
                                                         total_bytes_send += (frame_data.data.len() * 2) as u64;
                                                     }
                                                     frame_id += 1;
-                                                    break;
+                                                    decoded_frames += 1;
+                                                    if data_buffer_index - consumed < STREAM_BUFFER_SIZE_MIN {
+                                                        break;
+                                                    }
                                                 }
                                             }
                                             // move forward
@@ -670,7 +727,6 @@ pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel>, bclk_p
 
     loop {
         let frame_data = FRAME_CHANNEL.receive().await;
-
         if !stats_start_init {
             stats_data.receive_bytes_per_sec = 0;
             stats_data_start = Instant::now();
@@ -678,6 +734,8 @@ pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel>, bclk_p
             stats_start_init = true;
         }
         frame_id = frame_data.id;
+        // println!("frame received frame_id = {}", frame_id);
+
         let frame_data_part = frame_data.data;
         let frame_data_part_u8 =
             unsafe { core::slice::from_raw_parts(&frame_data_part as *const _ as *const u8, frame_data_part.len() * 2) };
@@ -768,6 +826,162 @@ async fn handle_tp_touch_ft6206(i2c: asynch::i2c::I2cDevice<'static, CriticalSec
     }
 }
 
+#[embassy_executor::task]
+async fn handle_play_mp3_from_sd(sdcard_manager: &'static mut SdcardManager<SdCard<blocking::spi::SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI2, FullDuplexMode>, DummyPin>, GpioPin<Output<PushPull>, 14>, Delay>>, clocks: &'static Clocks<'static>) {
+    let data_buffer_layout = Layout::array::<u8>(STREAM_BUFFER_SIZE).unwrap();
+    let data_buffer_ptr = unsafe { ALLOCATOR.alloc(data_buffer_layout) };
+    let data_buffer = unsafe { core::slice::from_raw_parts_mut(data_buffer_ptr, data_buffer_layout.size()) };
+
+    let data_chunk_layout = Layout::array::<u8>(1024 * 4).unwrap();
+    let data_chunk_ptr = unsafe { ALLOCATOR.alloc(data_chunk_layout) };
+    let data_chunk = unsafe { core::slice::from_raw_parts_mut(data_chunk_ptr, data_chunk_layout.size()) };
+
+    let mut frame_data = FrameData::new();
+
+    let mut playback_paused = true;
+    let mut current_file = alloc::string::String::new();
+
+    'outer: loop {
+        if playback_paused {
+            println!("playback paused");
+            let control_data = CONTROL_DATA_SIGNAL.wait().await;
+            if control_data.change_url {
+                current_file.clear();
+                current_file.push_str(&control_data.url);
+            }
+            if control_data.play {
+                playback_paused = false;
+            }
+            continue;
+        }
+
+        sdcard_manager.open_root_dir().unwrap();
+        if let Ok(mp3_file) = sdcard_manager.open_file_in_root_dir_for_reading(current_file.as_str()) {
+            println!("Start playing mp3 {}", current_file);
+            let mut decoder = RawDecoder::new();
+            let mut meta_data = MetaData {
+                title: String::from(""),
+                bitrate: 0,
+                channels: 0,
+                sample_rate: 0,
+            };
+
+            let mut frame_id = 0;
+            let mut data_buffer_index = 0;
+            let mut eof = false;
+            let mut chunk_remaining = 0;
+            let mut bytes_read = 0;
+            let mut chunk_used = 0;
+            let mut finished = false;
+
+            loop {
+                if CONTROL_DATA_SIGNAL.signaled() {
+                    let control_data = CONTROL_DATA_SIGNAL.wait().await;
+                    println!("outer loop {:?}", control_data);
+                    if control_data.change_url {
+                        if current_file != control_data.url {
+                            current_file.clear();
+                            current_file.push_str(&control_data.url);
+
+                            // send silence before change
+                            send_short_silence().await;
+                            break;
+                        }
+                    } else if control_data.pause {
+                        playback_paused = true;
+
+                        // send silence before pause
+                        send_short_silence().await;
+                        break;
+                    }
+                }
+                while data_buffer_index < STREAM_BUFFER_SIZE {
+                    if chunk_remaining == 0 && !eof {
+                        // println!("load new chunk data_buffer_index = {}", data_buffer_index);
+                        if let Ok(num_read) = sdcard_manager.load_open_file_into_buffer(mp3_file, data_chunk) {
+                            if num_read == 0 {
+                                eof = true;
+                                break;
+                            }
+                            bytes_read += num_read;
+                            chunk_remaining = num_read;
+                            chunk_used = 0;
+                        }
+                    }
+
+                    // println!("refill from chunk data_buffer_index = {} size {}", data_buffer_index, chunk_remaining.min(data_buffer.len() - data_buffer_index));
+
+                    let mut chunk_read = 0;
+                    for i in 0..chunk_remaining.min(data_buffer.len() - data_buffer_index) {
+                        data_buffer[data_buffer_index + i] = data_chunk[chunk_used + i];
+                        chunk_read += 1
+                    }
+                    chunk_used += chunk_read;
+                    chunk_remaining -= chunk_read;
+                    data_buffer_index += chunk_read;
+                    // println!("{} {} {} {}", chunk_read, chunk_used, chunk_remaining, data_buffer_index);
+                }
+
+                let mut consumed = 0;
+                while let Some((frame, bytes_consumed)) = decoder.next(&data_buffer[consumed..data_buffer_index], &mut frame_data.data) {
+                    // println!("{}", data_buffer_index- consumed);
+                    consumed += bytes_consumed;
+                    if let Frame::Audio(audio) = frame {
+                        if meta_data.is_incomplete() {
+                            meta_data.channels = audio.channels();
+                            meta_data.sample_rate = audio.sample_rate();
+                            meta_data.bitrate = audio.bitrate();
+                            META_DATA_SIGNAL.signal(meta_data.clone());
+                        }
+                        frame_data.id = frame_id;
+                        // println!("samples = {}", audio.sample_count() * audio.channels());
+                        FRAME_CHANNEL.send(frame_data).await;
+                        frame_id += 1;
+                    } else if let Frame::Other(data) = frame {
+                        // TODO i3 tag parser?
+                        // println!("id3 tags {}", unsafe { from_utf8_unchecked(data) });
+                        // meta_data.title = unsafe { String::from(from_utf8_unchecked(&data[..256])) };
+                        // META_DATA_SIGNAL.signal(meta_data.clone());
+                    }
+                    if data_buffer_index - consumed < STREAM_BUFFER_SIZE_MIN && !eof {
+                        // println!("stop decode at {}", data_buffer_index - consumed);
+                        break;
+                    }
+                }
+                // println!("consumed = {}", consumed);
+                // move forward
+                data_buffer_index -= consumed;
+                for i in 0..data_buffer_index {
+                    data_buffer[i] = data_buffer[i + consumed];
+                }
+
+                if data_buffer_index == 0 && eof {
+                    println!("finished bytes_read = {}", bytes_read);
+                    finished = true;
+                    playback_paused = true;
+
+                    send_short_silence().await;
+                    break;
+                }
+            }
+
+            let res = sdcard_manager.close_open_file(mp3_file);
+            if res.is_err() {
+                println!("close file error {:?}", res.err().unwrap());
+            }
+            sdcard_manager.close_root_dir().unwrap();
+
+            if finished {
+                STATUS_DATA_SIGNAL.signal(StatusData::new_finished());
+            }
+        } else {
+            println!("Failed to play mp3 file {}", current_file.as_str());
+            sdcard_manager.close_root_dir().unwrap();
+            playback_paused = true;
+        }
+    }
+}
+
 fn get_left_button_pos(width: u32, height: u32) -> Point {
     Point::new(0, (height - GraphicUtils::get_button_size().height) as i32)
 }
@@ -823,6 +1037,30 @@ fn display_list_navigation<D>(display: &mut D, width: u32, height: u32, theme: &
     image_down.draw(display, background_style)?;
     image_up.draw(display, background_style)?;
     image_select.draw(display, background_style)
+}
+
+fn display_mode_navigation<D>(display: &mut D, width: u32, height: u32, theme: &Theme) -> Result<(), D::Error>
+    where D: DrawTarget<Color=Rgb565> {
+    let color = theme.button_foreground_color;
+    let icon_radio = icons::size24px::connectivity::Wifi::new(color);
+    let icon_sd = icons::size24px::devices::HardDrive::new(color);
+
+    let image_radio = Button::new(&icon_radio, get_left_button_pos(width, height));
+    let image_sd = Button::new(&icon_sd, get_right_button_pos(width, height));
+
+    let background_style = PrimitiveStyleBuilder::new()
+        .fill_color(theme.button_background_color)
+        .build();
+    image_radio.draw(display, background_style)?;
+    image_sd.draw(display, background_style)
+}
+
+pub fn from_ascii(bytes: &[u8]) -> Result<&str, &'static str> {
+    if bytes.iter().all(|b| *b < 128) {
+        Ok(unsafe { core::str::from_utf8_unchecked(bytes) })
+    } else {
+        Err("Not an ascii!")
+    }
 }
 
 #[main]
@@ -895,6 +1133,8 @@ async fn main(spawner: Spawner) {
     let mut i2c0_dev1 = asynch::i2c::I2cDevice::new(i2c0_bus_static);
     let has_tsc2007 = i2c0_dev1.read(TSC2007_ADDR, &mut [0]).await.is_ok();
     println!("has_tsc2007 = {}", has_tsc2007);
+    let has_ft6206 = i2c0_dev1.read(ft6236_asynch::DEFAULT_ADDR, &mut [0]).await.is_ok();
+    println!("has_ft6206 = {}", has_ft6206);
 
     let sclk = io.pins.gpio5;
     let miso = io.pins.gpio21;
@@ -910,12 +1150,13 @@ async fn main(spawner: Spawner) {
         .with_pins(Some(sclk), Some(mosi), Some(miso), NO_PIN);
 
     let spi2_bus = blocking_mutex::Mutex::<blocking_mutex::raw::CriticalSectionRawMutex, _>::new(RefCell::new(spi2));
+    let spi2_bus_static = make_static!(spi2_bus);
 
     let display_spi = blocking::spi::SpiDevice::new(
-        &spi2_bus,
+        spi2_bus_static,
         display_cs);
     let sd_spi = blocking::spi::SpiDevice::new(
-        &spi2_bus,
+        spi2_bus_static,
         DummyPin);
 
     let spi_iface = SPIInterfaceNoCS::new(display_spi, dc);
@@ -960,10 +1201,10 @@ async fn main(spawner: Spawner) {
                                      theme.screen_background_color, character_styles.default_character_style(),
                                      &theme);
 
-    let sdcard = embedded_sdmmc::sdcard::SdCard::new(sd_spi, sd_cs, Delay);
-    let mut sdcard_manager = SdcardManager::new(sdcard);
+    let sdcard = SdCard::new(sd_spi, sd_cs, Delay);
+    let mut sdcard_manager = make_static!(SdcardManager::new(sdcard));
 
-    let mut root_file_list = Vec::new();
+    let mut root_file_list: Vec<DirEntry> = Vec::new();
     if let Ok(()) = sdcard_manager.open_root_dir() {
         match sdcard_manager.get_root_dir_entries(&mut root_file_list) {
             Ok(()) => {}
@@ -971,17 +1212,21 @@ async fn main(spawner: Spawner) {
         }
     }
     let mut station_list: Vec<RadioStation> = Vec::new();
+    let mut mp3file_list: Vec<MP3File> = Vec::new();
 
     for file in &root_file_list {
         if file.name.to_string() == "RADIO.JSO" {
             let mut buffer_vec = vec![0; file.size as usize];
             let load_result = sdcard_manager.load_root_dir_file_into_buffer("RADIO.JSO", &mut buffer_vec);
             if load_result.is_ok() {
-                let mut sd_station_list = serde_json_core::from_slice::<RadioStationList>(buffer_vec.as_slice()).unwrap().0;
-                station_list.append(&mut sd_station_list.list);
+                let mut sd_station_list = serde_json::from_slice::<RadioStationList>(buffer_vec.as_slice()).unwrap().list;
+                station_list.append(&mut sd_station_list);
             }
+        } else if from_ascii(file.name.extension()).unwrap() == "MP3" {
+            mp3file_list.push(MP3File::new(&file.name.to_string()));
         }
     }
+    sdcard_manager.close_root_dir().unwrap();
 
     progress.update_text(&mut display, "Connecting to Wifi...").unwrap();
 
@@ -1026,9 +1271,9 @@ async fn main(spawner: Spawner) {
     let dma = Dma::new(system.dma);
     let dma_channel = dma.i2s0channel;
 
-    // from dma_buffers macro
+    // from dma_circular_buffers macro
     let tx_descriptors = make_static!([DmaDescriptor::EMPTY; (I2S_BUFFER_SIZE + 4091) / 4092]);
-    let rx_descriptors = make_static!([DmaDescriptor::EMPTY; (I2S_BUFFER_SIZE + 4091) / 4092]);
+    let rx_descriptors = make_static!([DmaDescriptor::EMPTY; 0]);
 
     let i2s = I2s::new(
         peripherals.I2S0,
@@ -1051,22 +1296,43 @@ async fn main(spawner: Spawner) {
         station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
     }
 
-    let mut current_screen = 0;
+    let mut mp3file_mode = if mp3file_list.len() != 0 { true } else { false };
+    let mut current_screen = -1;
 
-    let mut select_list = graphics::List::new(&station_list, Point::new(10, 10),
-                                              Size::new(display_width - 10, (display_height - GraphicUtils::get_button_size().height)),
-                                              &theme);
-    select_list.draw(&mut display).unwrap();
-    display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
+    println!("{:?}", station_list);
 
-    let default_url: &mut String<RADIO_STATION_URL_LEN_MAX> = make_static!(String::from(station_list.first().unwrap().url.as_str()));
+    let mut radio_select_list = graphics::List::new(&station_list, Point::new(10, 10),
+                                                    Size::new(display_width - 10, (display_height - GraphicUtils::get_button_size().height)),
+                                                    &theme);
+    if !mp3file_mode {
+        current_screen = 0;
+        spawner.must_spawn(handle_radio_stream(stack));
+        radio_select_list.draw(&mut display).unwrap();
+        display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
+    }
 
-    spawner.must_spawn(handle_radio_stream(stack, default_url));
+    println!("{:?}", mp3file_list);
+
+    let mut mp3file_select_list = graphics::List::new(&mp3file_list, Point::new(10, 10),
+                                                      Size::new(display_width - 10, (display_height - GraphicUtils::get_button_size().height)),
+                                                      &theme);
+    if mp3file_mode {
+        current_screen = -1;
+        display_mode_navigation(&mut display, display_width, display_height, &theme).unwrap();
+        // mp3file_select_list.draw(&mut display).unwrap();
+    }
+
     spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
+    // if !mp3file_mode {
+    //     spawner.must_spawn(handle_radio_stream(stack));
+    // }
+    // if mp3file_mode {
+    //     spawner.must_spawn(handle_play_mp3_from_sd(sdcard_manager, clocks));
+    // }
 
     if has_tsc2007 {
         spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display_width as u16, display_height as u16));
-    } else {
+    } else if has_ft6206 {
         spawner.must_spawn(handle_tp_touch_ft6206(i2c0_dev1, io.pins.gpio32, display_orientation, display_width as u16, display_height as u16));
     }
 
@@ -1101,6 +1367,25 @@ async fn main(spawner: Spawner) {
     let mut format_label = Label::new(" ", format_line_pos, display_width, theme.screen_background_color, character_styles.medium_character_style(), &theme);
     let mut error_label = Label::new(" ", error_line_pos, display_width, theme.screen_background_color, error_character_style, &theme);
 
+    if current_screen == -1 {
+        let touch_data = TOUCH_DATA_SIGNAL.wait().await;
+        let touch_point = Point::new(touch_data.x as i32, touch_data.y as i32);
+
+        if icon_left_area.contains(touch_point) {
+            mp3file_mode = false;
+            current_screen = 0;
+            spawner.must_spawn(handle_radio_stream(stack));
+            radio_select_list.draw(&mut display).unwrap();
+            display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
+        } else if icon_right_area.contains(touch_point) {
+            mp3file_mode = true;
+            current_screen = 0;
+            spawner.must_spawn(handle_play_mp3_from_sd(sdcard_manager, clocks));
+            mp3file_select_list.draw(&mut display).unwrap();
+            display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
+        }
+    }
+
     loop {
         if META_DATA_SIGNAL.signaled() {
             meta_data = META_DATA_SIGNAL.wait().await;
@@ -1111,9 +1396,13 @@ async fn main(spawner: Spawner) {
                 // clear error
                 error_label.update_text(&mut display, " ").unwrap();
 
-                title_label.update_text(&mut display, station_list[status.url_index].title.as_str()).unwrap();
+                if mp3file_mode {
+                    title_label.update_text(&mut display, mp3file_list[status.url_index].file_name.as_str()).unwrap();
+                } else {
+                    title_label.update_text(&mut display, station_list[status.url_index].title.as_str()).unwrap();
+                }
 
-                let mut buf: String<META_DATA_TITLE_LEN_MAX> = String::new();
+                let mut buf = alloc::string::String::new();
 
                 let mut title = meta_data.title.strip_prefix("StreamTitle='").unwrap_or(meta_data.title.as_str());
                 title = title.strip_suffix("';").unwrap_or(meta_data.title.as_str());
@@ -1142,7 +1431,7 @@ async fn main(spawner: Spawner) {
                     esp32_hal::i2s::private::update_config(Standard::Philips,
                                                            DataFormat::Data16Channel16,
                                                            meta_data.sample_rate.Hz(),
-                                                           &clocks);
+                                                           clocks);
                 }
             }
         }
@@ -1161,25 +1450,44 @@ async fn main(spawner: Spawner) {
 
             if icon_left_area.contains(touch_point) {
                 if current_screen == 0 {
-                    select_list.scroll_up(&mut display).unwrap();
+                    if mp3file_mode {
+                        mp3file_select_list.scroll_up(&mut display).unwrap();
+                    } else {
+                        radio_select_list.scroll_up(&mut display).unwrap();
+                    }
                 } else if current_screen == 1 {
                     println!("control change_url");
-                    let url_index_new = (status.url_index + 1) % station_list.len();
+                    let url_index_new = if mp3file_mode { (status.url_index + 1) % mp3file_list.len() } else {
+                        (status.url_index + 1) % station_list.len()
+                    };
                     status.set_playing(url_index_new);
-                    select_list.set_selected_index(url_index_new);
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[url_index_new].url));
+                    if mp3file_mode {
+                        mp3file_select_list.set_selected_index(url_index_new);
+                        CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&mp3file_list[url_index_new].file_name));
+                    } else {
+                        radio_select_list.set_selected_index(url_index_new);
+                        CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[url_index_new].url));
+                    }
                 }
             }
             if icon_right_area.contains(touch_point) {
                 if current_screen == 0 {
-                    select_list.scroll_down(&mut display).unwrap();
+                    if mp3file_mode {
+                        mp3file_select_list.scroll_down(&mut display).unwrap();
+                    } else {
+                        radio_select_list.scroll_down(&mut display).unwrap();
+                    }
                 } else if current_screen == 1 {
                     println!("control play_pause");
                     status.toggle_playing();
                     if status.paused {
                         CONTROL_DATA_SIGNAL.signal(ControlData::new_pause());
                     } else {
-                        CONTROL_DATA_SIGNAL.signal(ControlData::new_play(&station_list[status.url_index].url));
+                        if mp3file_mode {
+                            CONTROL_DATA_SIGNAL.signal(ControlData::new_play(&mp3file_list[status.url_index].file_name));
+                        } else {
+                            CONTROL_DATA_SIGNAL.signal(ControlData::new_play(&station_list[status.url_index].url));
+                        }
                     }
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 }
@@ -1191,40 +1499,74 @@ async fn main(spawner: Spawner) {
                     // show current meta data
                     META_DATA_SIGNAL.signal(meta_data.clone());
 
-                    let url_index_new = select_list.get_selected_index();
+                    let url_index_new = if mp3file_mode { mp3file_select_list.get_selected_index() } else { radio_select_list.get_selected_index() };
                     status.set_playing(url_index_new);
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[url_index_new].url));
-
+                    if mp3file_mode {
+                        CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&mp3file_list[url_index_new].file_name));
+                    } else {
+                        CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[url_index_new].url));
+                    }
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 } else if current_screen == 1 {
                     current_screen = 0;
                     display.clear_screen(theme.screen_background_color).unwrap();
 
-                    select_list.draw(&mut display).unwrap();
+                    if mp3file_mode {
+                        mp3file_select_list.draw(&mut display).unwrap();
+                    } else {
+                        radio_select_list.draw(&mut display).unwrap();
+                    }
                     display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
                 }
             }
-            if select_list.get_bounding_box().contains(touch_point) {
-                if let Ok(selected_index) = select_list.select_at_pos(&mut display, touch_point) {
-                    current_screen = 1;
-                    display.clear_screen(theme.screen_background_color).unwrap();
-                    // show current meta data
-                    META_DATA_SIGNAL.signal(meta_data.clone());
+            if current_screen == 0 {
+                if mp3file_mode {
+                    if mp3file_select_list.get_bounding_box().contains(touch_point) {
+                        if let Ok(selected_index) = mp3file_select_list.select_at_pos(&mut display, touch_point) {
+                            current_screen = 1;
+                            display.clear_screen(theme.screen_background_color).unwrap();
+                            // show current meta data
+                            META_DATA_SIGNAL.signal(meta_data.clone());
 
-                    status.set_playing(selected_index);
-                    CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[selected_index].url));
+                            status.set_playing(selected_index);
+                            CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&mp3file_list[selected_index].file_name));
 
-                    display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
+                            display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
+                        }
+                    }
+                } else {
+                    if radio_select_list.get_bounding_box().contains(touch_point) {
+                        if let Ok(selected_index) = radio_select_list.select_at_pos(&mut display, touch_point) {
+                            current_screen = 1;
+                            display.clear_screen(theme.screen_background_color).unwrap();
+                            // show current meta data
+                            META_DATA_SIGNAL.signal(meta_data.clone());
+
+                            status.set_playing(selected_index);
+                            CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&station_list[selected_index].url));
+
+                            display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
+                        }
+                    }
                 }
             }
         }
         if STATUS_DATA_SIGNAL.signaled() {
-            let error_status = STATUS_DATA_SIGNAL.wait().await;
-            if error_status.error {
+            let status_in = STATUS_DATA_SIGNAL.wait().await;
+            if status_in.error {
                 status.set_paused();
                 if current_screen == 1 {
-                    error_label.update_text(&mut display, get_error_description(error_status.error_type)).unwrap();
+                    error_label.update_text(&mut display, get_error_description(status_in.error_type)).unwrap();
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
+                }
+            }
+            if status_in.finished {
+                if mp3file_mode {
+                    println!("next mp3 track");
+                    let url_index_new = (status.url_index + 1) % mp3file_list.len();
+                    status.set_playing(url_index_new);
+                    mp3file_select_list.set_selected_index(url_index_new);
+                    CONTROL_DATA_SIGNAL.signal(ControlData::new_change_url(&mp3file_list[url_index_new].file_name));
                 }
             }
         }
