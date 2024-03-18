@@ -41,30 +41,32 @@ use embedded_iconoir::icons;
 use embedded_iconoir::prelude::IconoirNewIcon;
 use embedded_sdmmc::{DirEntry, SdCard};
 use embedded_svc::io::asynch::BufRead;
-use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
-use esp32_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
-use esp32_hal::{Rng, timer::TimerGroup};
-use esp32_hal::clock::Clocks;
-use esp32_hal::dma::{DmaDescriptor, DmaPriority};
-use esp32_hal::gpio::{GpioPin, NO_PIN, Output, PushPull, Unknown};
-use esp32_hal::i2c::I2C;
-use esp32_hal::i2s::{DataFormat, I2s, Standard};
-use esp32_hal::i2s::asynch::I2sWriteDmaAsync;
-use esp32_hal::ledc::{channel, HighSpeed, LEDC, timer};
-use esp32_hal::pdma::{Dma, I2s0DmaChannel};
-use esp32_hal::peripherals::{I2C0, I2S0, SPI2};
-use esp32_hal::spi::{FullDuplexMode, SpiMode};
-use esp32_hal::spi::master::{Instance, Spi};
+use esp_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
+use esp_hal::{Rng, timer::TimerGroup};
+use esp_hal::clock::Clocks;
+use esp_hal::dma::{DmaDescriptor, DmaPriority};
+use esp_hal::gpio::{GpioPin, NO_PIN, Output, PushPull, Unknown};
+use esp_hal::i2c::I2C;
+use esp_hal::i2s::{DataFormat, I2s, Standard};
+use esp_hal::i2s::asynch::I2sWriteDmaAsync;
+use esp_hal::ledc::{channel, HighSpeed, LEDC, LowSpeed, LSGlobalClkSource, timer};
+use esp_hal::dma::{Dma, I2s0DmaChannel};
+use esp_hal::peripherals::{I2C0, I2S0, SPI2};
+use esp_hal::spi::{FullDuplexMode, SpiMode};
+use esp_hal::spi::master::{Instance, Spi};
 use esp32_utils_crate::dummy_pin::DummyPin;
 use esp32_utils_crate::fonts::CharacterStyles;
+use esp32_utils_crate::ft6236_asynch::EventType::PressDown;
+use esp32_utils_crate::ft6236_asynch::{FT6236, FT6236_DEFAULT_ADDR};
+use esp32_utils_crate::graphics::{Button, GraphicUtils, Label, ListItem, Progress, Theme};
 use esp32_utils_crate::sdcard::SdcardManager;
 use esp32_utils_crate::touch_mapper::TouchPosMapper;
 use esp32_utils_crate::tsc2007::{Tsc2007, TSC2007_ADDR};
-use esp32_utils_crate::tsc2007;
+use esp32_utils_crate::{graphics, tsc2007};
 use esp_backtrace;
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize};
-use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
+use esp_wifi::wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 use profont::PROFONT_24_POINT;
 use reqwless::client::HttpClient;
@@ -79,12 +81,7 @@ use static_cell::make_static;
 use static_cell::StaticCell;
 
 use crate::Error::NoError;
-use crate::ft6236_asynch::EventType::PressDown;
-use crate::ft6236_asynch::FT6236;
-use crate::graphics::{Button, GraphicUtils, Label, ListItem, Progress, Theme};
 
-mod graphics;
-mod ft6236_asynch;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
@@ -113,6 +110,8 @@ const SILENCE_DELAY_FRAMES: u64 = 128;
 
 const SILENCE_SHORT_DELAY_FRAMES: u64 = 32;
 
+const SCREEN_TIMEOUT_SECS: u64 = 30;
+const SCREEN_BRIGHTNESS_PERCENT: u8 = 30;
 #[derive(Debug, Clone)]
 struct MetaData {
     title: alloc::string::String,
@@ -360,29 +359,6 @@ impl MP3File {
     fn new(name: &str) -> Self {
         MP3File {
             file_name: String::from(name),
-        }
-    }
-}
-
-impl Theme {
-    fn new_dark_theme() -> Self {
-        Theme {
-            button_background_color: Rgb565::new(9, 37, 20),
-            button_foreground_color: Rgb565::WHITE,
-            screen_background_color: Rgb565::BLACK,
-            text_color_primary: Rgb565::WHITE,
-            highlight_color: Rgb565::new(15, 30, 15),
-            error_color: Rgb565::RED,
-        }
-    }
-    fn new_light_theme() -> Self {
-        Theme {
-            button_background_color: Rgb565::new(9, 37, 20),
-            button_foreground_color: Rgb565::WHITE,
-            screen_background_color: Rgb565::WHITE,
-            text_color_primary: Rgb565::BLACK,
-            highlight_color: Rgb565::new(24, 49, 24),
-            error_color: Rgb565::RED,
         }
     }
 }
@@ -1097,11 +1073,14 @@ async fn main(spawner: Spawner) {
         peripherals.LEDC,
         &clocks);
 
-    let mut hstimer0 = ledc.get_timer::<HighSpeed>(timer::Number::Timer0);
-    hstimer0
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+
+    let mut lstimer0 = ledc.get_timer::<LowSpeed>(timer::Number::Timer0);
+
+    lstimer0
         .configure(timer::config::Config {
             duty: timer::config::Duty::Duty5Bit,
-            clock_source: timer::HSClockSource::APBClk,
+            clock_source: timer::LSClockSource::APBClk,
             frequency: 24u32.kHz(),
         })
         .unwrap();
@@ -1109,8 +1088,8 @@ async fn main(spawner: Spawner) {
     let mut channel0 = ledc.get_channel(channel::Number::Channel0, bl_pin);
     channel0
         .configure(channel::config::Config {
-            timer: &hstimer0,
-            duty_pct: 30,
+            timer: &lstimer0,
+            duty_pct: SCREEN_BRIGHTNESS_PERCENT,
             pin_config: channel::config::PinConfig::PushPull,
         })
         .unwrap();
@@ -1133,7 +1112,7 @@ async fn main(spawner: Spawner) {
     let mut i2c0_dev1 = asynch::i2c::I2cDevice::new(i2c0_bus_static);
     let has_tsc2007 = i2c0_dev1.read(TSC2007_ADDR, &mut [0]).await.is_ok();
     println!("has_tsc2007 = {}", has_tsc2007);
-    let has_ft6206 = i2c0_dev1.read(ft6236_asynch::DEFAULT_ADDR, &mut [0]).await.is_ok();
+    let has_ft6206 = i2c0_dev1.read(FT6236_DEFAULT_ADDR, &mut [0]).await.is_ok();
     println!("has_ft6206 = {}", has_ft6206);
 
     let sclk = io.pins.gpio5;
@@ -1268,7 +1247,7 @@ async fn main(spawner: Spawner) {
 
     display.clear_screen(theme.screen_background_color).unwrap();
 
-    let dma = Dma::new(system.dma);
+    let dma = Dma::new(peripherals.DMA);
     let dma_channel = dma.i2s0channel;
 
     // from dma_circular_buffers macro
@@ -1386,6 +1365,9 @@ async fn main(spawner: Spawner) {
         }
     }
 
+    let mut display_off = false;
+    let mut time = Instant::now();
+
     loop {
         if META_DATA_SIGNAL.signaled() {
             meta_data = META_DATA_SIGNAL.wait().await;
@@ -1428,7 +1410,7 @@ async fn main(spawner: Spawner) {
                 if meta_data.sample_rate != current_sample_rate {
                     println!("change sample rate to {}", meta_data.sample_rate);
                     current_sample_rate = meta_data.sample_rate;
-                    esp32_hal::i2s::private::update_config(Standard::Philips,
+                    esp_hal::i2s::private::update_config(Standard::Philips,
                                                            DataFormat::Data16Channel16,
                                                            meta_data.sample_rate.Hz(),
                                                            clocks);
@@ -1448,6 +1430,12 @@ async fn main(spawner: Spawner) {
             let touch_data = TOUCH_DATA_SIGNAL.wait().await;
             let touch_point = Point::new(touch_data.x as i32, touch_data.y as i32);
 
+            if display_off {
+                if let Ok(()) = channel0.set_duty(SCREEN_BRIGHTNESS_PERCENT) {
+                    display_off = false;
+                }
+            }
+            time = Instant::now();
             if icon_left_area.contains(touch_point) {
                 if current_screen == 0 {
                     if mp3file_mode {
@@ -1593,7 +1581,13 @@ async fn main(spawner: Spawner) {
         //     // }
         //     frame_index += 1;
         // }
-
-        Timer::after(Duration::from_millis(250)).await
+        if !display_off {
+            if time.elapsed().as_secs() >= SCREEN_TIMEOUT_SECS {
+                if let Ok(()) = channel0.set_duty(0) {
+                    display_off = true;
+                }
+            }
+        }
+        Timer::after(Duration::from_millis(100)).await
     }
 }

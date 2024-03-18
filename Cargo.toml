@@ -6,11 +6,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-esp32-hal = { version = "0.18.0", features = ["embassy", "embassy-time-timg0", "embassy-executor-thread", "async", "psram-2m"] }
-esp-backtrace = { version = "0.10.0", features = ["esp32", "panic-handler", "exception-handler", "print-uart", "colors", "esp-println"] }
-esp-println = { version = "0.8.0", features = ["esp32", "log"] }
-esp-wifi = { version = "0.3.0", features = ["esp32", "wifi", "embassy-net"] }
-heapless = { version = "0.7.15", default-features = false, features = ["serde"] }
+esp-hal = { version = "0.16.0", features = ["esp32", "embassy", "embassy-time-timg0", "embassy-executor-thread", "async", "psram-2m"] }
+esp-backtrace = { version = "0.11.1", features = ["esp32", "panic-handler", "exception-handler", "colors", "println"] }
+esp-println = { version = "0.9.1", features = ["esp32", "log"] }
+esp-wifi = { version = "0.4.0", features = ["esp32", "wifi", "embassy-net"] }
+heapless = { version = "0.8.0", default-features = false, features = ["serde"] }
 log = { version = "0.4.18" }
 esp-alloc = { version = "0.3.0" }
 static_cell = { version = "2.0.0", features = ["nightly"] }
@@ -42,10 +42,10 @@ opt-level = 3
 
 [profile.release]
 opt-level = 3
+debug = true
 
 [patch.crates-io]
-esp-hal-common = { git = "https://github.com/maxwen/esp-hal", branch = "0.15.0" }
+esp-hal = { path = "../esp-hal/esp-hal" }
 reqwless = { path = "/home/maxl/esp32/rust/reqwless" }
 rmp3 = { path = "../rmp3" }
 ili9341 = { git = "https://github.com/maxwen/ili9341-rs" }
-#embassy-sync = { path = "/home/maxl/esp32/rust/embassy/embassy-sync" }
