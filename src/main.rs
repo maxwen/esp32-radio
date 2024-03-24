@@ -26,14 +26,12 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::Drawable;
-use embedded_graphics::geometry::{Dimensions, Point, Size};
+use embedded_graphics::geometry::{Point, Size};
 use embedded_graphics::iterator::PixelIteratorExt;
 use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
-use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
-use embedded_graphics::prelude::Primitive;
+use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::{Alignment, Baseline, TextStyle, TextStyleBuilder};
-use embedded_graphics::text::renderer::TextRenderer;
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::i2c::I2c;
@@ -41,29 +39,29 @@ use embedded_iconoir::icons;
 use embedded_iconoir::prelude::IconoirNewIcon;
 use embedded_sdmmc::{DirEntry, SdCard};
 use embedded_svc::io::asynch::BufRead;
-use esp_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
-use esp_hal::{Rng, timer::TimerGroup};
-use esp_hal::clock::Clocks;
-use esp_hal::dma::{DmaDescriptor, DmaPriority};
-use esp_hal::gpio::{GpioPin, NO_PIN, Output, PushPull, Unknown};
-use esp_hal::i2c::I2C;
-use esp_hal::i2s::{DataFormat, I2s, Standard};
-use esp_hal::i2s::asynch::I2sWriteDmaAsync;
-use esp_hal::ledc::{channel, HighSpeed, LEDC, LowSpeed, LSGlobalClkSource, timer};
-use esp_hal::dma::{Dma, I2s0DmaChannel};
-use esp_hal::peripherals::{I2C0, I2S0, SPI2};
-use esp_hal::spi::{FullDuplexMode, SpiMode};
-use esp_hal::spi::master::{Instance, Spi};
+use esp32_utils_crate::{graphics, tsc2007};
 use esp32_utils_crate::dummy_pin::DummyPin;
 use esp32_utils_crate::fonts::CharacterStyles;
-use esp32_utils_crate::ft6236_asynch::EventType::PressDown;
 use esp32_utils_crate::ft6236_asynch::{FT6236, FT6236_DEFAULT_ADDR};
+use esp32_utils_crate::ft6236_asynch::EventType::PressDown;
 use esp32_utils_crate::graphics::{Button, GraphicUtils, Label, ListItem, Progress, Theme};
 use esp32_utils_crate::sdcard::SdcardManager;
 use esp32_utils_crate::touch_mapper::TouchPosMapper;
 use esp32_utils_crate::tsc2007::{Tsc2007, TSC2007_ADDR};
-use esp32_utils_crate::{graphics, tsc2007};
 use esp_backtrace;
+use esp_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
+use esp_hal::{Rng, timer::TimerGroup};
+use esp_hal::clock::Clocks;
+use esp_hal::dma::{DmaDescriptor, DmaPriority};
+use esp_hal::dma::{Dma, I2s0DmaChannel};
+use esp_hal::gpio::{GpioPin, NO_PIN, Output, PushPull, Unknown};
+use esp_hal::i2c::I2C;
+use esp_hal::i2s::{DataFormat, I2s, Standard};
+use esp_hal::i2s::asynch::I2sWriteDmaAsync;
+use esp_hal::ledc::{channel, LEDC, LowSpeed, LSGlobalClkSource, timer};
+use esp_hal::peripherals::{I2C0, I2S0, SPI2};
+use esp_hal::spi::{FullDuplexMode, SpiMode};
+use esp_hal::spi::master::{Instance, Spi};
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize};
 use esp_wifi::wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
@@ -81,7 +79,6 @@ use static_cell::make_static;
 use static_cell::StaticCell;
 
 use crate::Error::NoError;
-
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
@@ -112,6 +109,7 @@ const SILENCE_SHORT_DELAY_FRAMES: u64 = 32;
 
 const SCREEN_TIMEOUT_SECS: u64 = 30;
 const SCREEN_BRIGHTNESS_PERCENT: u8 = 30;
+
 #[derive(Debug, Clone)]
 struct MetaData {
     title: alloc::string::String,
@@ -300,13 +298,14 @@ struct RadioStationList {
 }
 
 impl ListItem for RadioStation {
-    fn get_text(&self) -> &str {
-        self.title.as_str()
+    fn get_text(&self) -> String {
+        self.title.clone()
     }
 
     fn get_height(&self) -> u16 {
         self.get_font().character_size.height as u16
     }
+    fn get_width(&self, display_with: u32) -> u32 { display_with }
 
     fn get_font(&self) -> &MonoFont<'_> {
         &PROFONT_24_POINT
@@ -335,13 +334,15 @@ struct MP3File {
 }
 
 impl ListItem for MP3File {
-    fn get_text(&self) -> &str {
-        self.file_name.as_str()
+    fn get_text(&self) -> String {
+        self.file_name.clone()
     }
 
     fn get_height(&self) -> u16 {
         self.get_font().character_size.height as u16
     }
+
+    fn get_width(&self, display_with: u32) -> u32 { display_with }
 
     fn get_font(&self) -> &MonoFont<'_> {
         &PROFONT_24_POINT
@@ -679,7 +680,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
 
 #[embassy_executor::task]
 pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel>, bclk_pin: GpioPin<Unknown, 26>, ws_pin: GpioPin<Unknown, 25>,
-                                 dout_pin: GpioPin<Unknown, 12>) {
+                                 dout_pin: GpioPin<Unknown, 27>) {
     let i2s_tx = i2s
         .i2s_tx
         .with_bclk(bclk_pin)
@@ -1301,7 +1302,7 @@ async fn main(spawner: Spawner) {
         // mp3file_select_list.draw(&mut display).unwrap();
     }
 
-    spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio12));
+    spawner.must_spawn(handle_frame_stream(i2s, io.pins.gpio26, io.pins.gpio25, io.pins.gpio27));
     // if !mp3file_mode {
     //     spawner.must_spawn(handle_radio_stream(stack));
     // }
@@ -1411,9 +1412,9 @@ async fn main(spawner: Spawner) {
                     println!("change sample rate to {}", meta_data.sample_rate);
                     current_sample_rate = meta_data.sample_rate;
                     esp_hal::i2s::private::update_config(Standard::Philips,
-                                                           DataFormat::Data16Channel16,
-                                                           meta_data.sample_rate.Hz(),
-                                                           clocks);
+                                                         DataFormat::Data16Channel16,
+                                                         meta_data.sample_rate.Hz(),
+                                                         clocks);
                 }
             }
         }
@@ -1427,15 +1428,17 @@ async fn main(spawner: Spawner) {
         }
 
         if TOUCH_DATA_SIGNAL.signaled() {
+            time = Instant::now();
+
             let touch_data = TOUCH_DATA_SIGNAL.wait().await;
             let touch_point = Point::new(touch_data.x as i32, touch_data.y as i32);
 
             if display_off {
                 if let Ok(()) = channel0.set_duty(SCREEN_BRIGHTNESS_PERCENT) {
                     display_off = false;
+                    continue;
                 }
             }
-            time = Instant::now();
             if icon_left_area.contains(touch_point) {
                 if current_screen == 0 {
                     if mp3file_mode {
