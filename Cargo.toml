@@ -6,7 +6,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-esp-hal = { version = "0.16.0", features = ["esp32", "embassy", "embassy-time-timg0", "embassy-executor-thread", "async", "psram-2m"] }
+esp-hal = { version = "0.16.1", features = ["esp32", "embassy", "embassy-time-timg0", "embassy-executor-thread", "async", "psram-2m"] }
 esp-backtrace = { version = "0.11.1", features = ["esp32", "panic-handler", "exception-handler", "colors", "println"] }
 esp-println = { version = "0.9.1", features = ["esp32", "log"] }
 esp-wifi = { version = "0.4.0", features = ["esp32", "wifi", "embassy-net"] }
@@ -20,8 +20,6 @@ embassy-sync = "0.5.0"
 embassy-net = { version = "0.4.0", features = ["tcp", "udp", "dhcpv4", "medium-ethernet", "dns"] }
 embassy-embedded-hal = { version = "0.1.0" }
 embassy-futures = "0.1.1"
-ili9341 = "0.5.0"
-display-interface-spi = "0.4.1"
 embedded-graphics = "0.8.1"
 embedded-svc = { version = "0.27.0", default-features = false, features = ["log", "use_serde"] }
 embedded-hal = "1.0.0"
@@ -36,6 +34,8 @@ esp32-utils-crate = { path = "../esp32-utils-crate" }
 embedded-iconoir = { version = "0.2.3", features = ["96px", "48px"] }
 serde_json = { version = "1.0.114", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
+display-interface-spi = "0.5.0"
+mipidsi = "0.7.1"
 
 [profile.dev]
 opt-level = 3
@@ -46,6 +46,7 @@ debug = true
 
 [patch.crates-io]
 esp-hal = { path = "../esp-hal/esp-hal" }
+esp-wifi = { path = "../esp-wifi/esp-wifi"}
 reqwless = { path = "/home/maxl/esp32/rust/reqwless" }
 rmp3 = { path = "../rmp3" }
-ili9341 = { git = "https://github.com/maxwen/ili9341-rs" }
+mipidsi = { path = "../mipidsi/mipidsi"}

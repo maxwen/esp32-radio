@@ -12,7 +12,7 @@ use core::cell::RefCell;
 use core::fmt::Write;
 use core::str::from_utf8_unchecked;
 
-use display_interface_spi::SPIInterfaceNoCS;
+use display_interface_spi::SPIInterface;
 use embassy_embedded_hal::SetConfig;
 use embassy_embedded_hal::shared_bus::{asynch, blocking};
 use embassy_executor::Spawner;
@@ -26,7 +26,7 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::Drawable;
-use embedded_graphics::geometry::{Point, Size};
+use embedded_graphics::geometry::{OriginDimensions, Point, Size};
 use embedded_graphics::iterator::PixelIteratorExt;
 use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb565;
@@ -39,33 +39,35 @@ use embedded_iconoir::icons;
 use embedded_iconoir::prelude::IconoirNewIcon;
 use embedded_sdmmc::{DirEntry, SdCard};
 use embedded_svc::io::asynch::BufRead;
-use esp32_utils_crate::{graphics, tsc2007};
 use esp32_utils_crate::dummy_pin::DummyPin;
 use esp32_utils_crate::fonts::CharacterStyles;
 use esp32_utils_crate::ft6236_asynch::{FT6236, FT6236_DEFAULT_ADDR};
 use esp32_utils_crate::ft6236_asynch::EventType::PressDown;
+use esp32_utils_crate::graphics;
 use esp32_utils_crate::graphics::{Button, GraphicUtils, Label, ListItem, Progress, Theme};
 use esp32_utils_crate::sdcard::SdcardManager;
-use esp32_utils_crate::touch_mapper::TouchPosMapper;
-use esp32_utils_crate::tsc2007::{Tsc2007, TSC2007_ADDR};
+use esp32_utils_crate::tsc2007::TSC2007_ADDR;
 use esp_backtrace;
-use esp_hal::{clock::ClockControl, embassy, IO, peripherals::Peripherals, prelude::*, psram};
-use esp_hal::{Rng, timer::TimerGroup};
+use esp_hal::{Async, Blocking, clock::ClockControl, embassy, peripherals::Peripherals, prelude::*, psram};
 use esp_hal::clock::Clocks;
 use esp_hal::dma::{DmaDescriptor, DmaPriority};
 use esp_hal::dma::{Dma, I2s0DmaChannel};
-use esp_hal::gpio::{GpioPin, NO_PIN, Output, PushPull, Unknown};
+use esp_hal::gpio::{GpioPin, IO, NO_PIN, Output, PushPull, Unknown};
 use esp_hal::i2c::I2C;
 use esp_hal::i2s::{DataFormat, I2s, Standard};
 use esp_hal::i2s::asynch::I2sWriteDmaAsync;
-use esp_hal::ledc::{channel, LEDC, LowSpeed, LSGlobalClkSource, timer};
+use esp_hal::ledc::{channel, HighSpeed, LEDC, timer};
 use esp_hal::peripherals::{I2C0, I2S0, SPI2};
+use esp_hal::rng::Rng;
 use esp_hal::spi::{FullDuplexMode, SpiMode};
 use esp_hal::spi::master::{Instance, Spi};
+use esp_hal::timer::TimerGroup;
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize};
 use esp_wifi::wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
-use ili9341::{DisplaySize240x320, Ili9341, Orientation};
+use mipidsi::Builder;
+use mipidsi::models::ILI9341Rgb565;
+use mipidsi::options::{ColorOrder, Orientation, Rotation};
 use profont::PROFONT_24_POINT;
 use reqwless::client::HttpClient;
 use reqwless::headers::ContentType::AudioMpeg;
@@ -109,6 +111,8 @@ const SILENCE_SHORT_DELAY_FRAMES: u64 = 32;
 
 const SCREEN_TIMEOUT_SECS: u64 = 30;
 const SCREEN_BRIGHTNESS_PERCENT: u8 = 30;
+
+// static mut APP_CORE_STACK: esp_hal::cpu_control::Stack<8192> = esp_hal::cpu_control::Stack::new();
 
 #[derive(Debug, Clone)]
 struct MetaData {
@@ -679,7 +683,7 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
 }
 
 #[embassy_executor::task]
-pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel>, bclk_pin: GpioPin<Unknown, 26>, ws_pin: GpioPin<Unknown, 25>,
+pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel, Async,>, bclk_pin: GpioPin<Unknown, 26>, ws_pin: GpioPin<Unknown, 25>,
                                  dout_pin: GpioPin<Unknown, 27>) {
     let i2s_tx = i2s
         .i2s_tx
@@ -735,50 +739,13 @@ pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel>, bclk_p
 }
 
 #[embassy_executor::task]
-async fn handle_tp_touch_tsc2007(i2c: asynch::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0>>, tp_irq_pin: GpioPin<Unknown, 32>,
-                                 orientation: Orientation, width: u16, height: u16) {
-    let mut tsc2007 = Tsc2007::new(i2c);
-
-    let mut handle_touch: bool = false;
-    let mut tp_irq_input = tp_irq_pin.into_pull_down_input();
-
-    let pos_mapper = TouchPosMapper::new(240, 320, (tsc2007::TS_MINX, tsc2007::TS_MAXX), (tsc2007::TS_MINY, tsc2007::TS_MAXY));
-
-    loop {
-        tp_irq_input.wait_for_low().await.unwrap();
-        if let Ok(point) = tsc2007.touch().await {
-            let x = point.0;
-            let y = point.1;
-            let z = point.2;
-            if z > tsc2007::TS_MIN_PRESSURE {
-                if !handle_touch {
-                    handle_touch = true;
-                    // println!("{:?}", point);
-
-                    let (x_scaled, y_scaled) = match orientation {
-                        Orientation::Portrait => pos_mapper.map_touch_pos(x, y, width, height, 0),
-                        Orientation::Landscape => pos_mapper.map_touch_pos(x, y, width, height, 1),
-                        Orientation::PortraitFlipped => pos_mapper.map_touch_pos(x, y, width, height, 2),
-                        Orientation::LandscapeFlipped => pos_mapper.map_touch_pos(x, y, width, height, 3),
-                    };
-
-                    TOUCH_DATA_SIGNAL.signal(TouchData::new(x_scaled, y_scaled, z));
-                }
-            } else {
-                handle_touch = false;
-            }
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn handle_tp_touch_ft6206(i2c: asynch::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0>>, tp_irq_pin: GpioPin<Unknown, 32>,
-                                orientation: Orientation, width: u16, height: u16) {
+async fn handle_tp_touch_ft6206(i2c: asynch::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0, Async>>, tp_irq_pin: GpioPin<Unknown, 32>,
+                                orientation: Rotation, width: u16, height: u16) {
     let mut ft6206 = FT6236::new(i2c);
     let mut tp_irq_input = tp_irq_pin.into_pull_down_input();
 
     loop {
-        tp_irq_input.wait_for_low().await.unwrap();
+        tp_irq_input.wait_for_low().await;
         if let Ok(point) = ft6206.get_point0().await {
             if point.is_some() {
                 let point_event = point.unwrap();
@@ -786,13 +753,13 @@ async fn handle_tp_touch_ft6206(i2c: asynch::i2c::I2cDevice<'static, CriticalSec
                 let y = point_event.y;
                 let z = point_event.weight;
                 if point_event.event == PressDown {
-                    // println!("{:?}", point_event);
                     let (x, y) = match orientation {
-                        Orientation::Portrait => (width - x, height - y),
-                        Orientation::Landscape => (width - y, x),
-                        Orientation::PortraitFlipped => (x, y),
-                        Orientation::LandscapeFlipped => (y, height - x)
+                        Rotation::Deg0 => (width - x, height - y),
+                        Rotation::Deg90 => (width - y, x),
+                        Rotation::Deg180 => (x, y),
+                        Rotation::Deg270 => (y, height - x)
                     };
+                    println!("{}x{}", x, y);
 
                     TOUCH_DATA_SIGNAL.signal(TouchData::new(x, y, z.into()));
                     // debounce
@@ -1053,10 +1020,11 @@ async fn main(spawner: Spawner) {
         ClockControl::max(system.clock_control).freeze(),
         Clocks
     );
-    let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
+
+    let timer_group0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
     embassy::init(&clocks, timer_group0);
 
-    let timer_group1 = TimerGroup::new(peripherals.TIMG1, &clocks);
+    let timer_group1 = TimerGroup::new(peripherals.TIMG1, &clocks, None);
     let mut rng = Rng::new(peripherals.RNG);
     let _init = initialize(
         EspWifiInitFor::Wifi,
@@ -1074,14 +1042,11 @@ async fn main(spawner: Spawner) {
         peripherals.LEDC,
         &clocks);
 
-    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
-
-    let mut lstimer0 = ledc.get_timer::<LowSpeed>(timer::Number::Timer0);
-
-    lstimer0
+    let mut hstimer0 = ledc.get_timer::<HighSpeed>(timer::Number::Timer0);
+    hstimer0
         .configure(timer::config::Config {
             duty: timer::config::Duty::Duty5Bit,
-            clock_source: timer::LSClockSource::APBClk,
+            clock_source: timer::HSClockSource::APBClk,
             frequency: 24u32.kHz(),
         })
         .unwrap();
@@ -1089,7 +1054,7 @@ async fn main(spawner: Spawner) {
     let mut channel0 = ledc.get_channel(channel::Number::Channel0, bl_pin);
     channel0
         .configure(channel::config::Config {
-            timer: &lstimer0,
+            timer: &hstimer0,
             duty_pct: SCREEN_BRIGHTNESS_PERCENT,
             pin_config: channel::config::PinConfig::PushPull,
         })
@@ -1097,9 +1062,9 @@ async fn main(spawner: Spawner) {
 
     // enable i2c_power
     let i2c_power = io.pins.gpio2;
-    i2c_power.into_push_pull_output().set_high().unwrap();
+    i2c_power.into_push_pull_output().set_high();
 
-    let i2c0 = I2C::new(
+    let i2c0 = I2C::new_async(
         peripherals.I2C0,
         io.pins.gpio22,
         io.pins.gpio20,
@@ -1110,10 +1075,10 @@ async fn main(spawner: Spawner) {
     let i2c0_bus = mutex::Mutex::<blocking_mutex::raw::CriticalSectionRawMutex, _>::new(i2c0);
     let i2c0_bus_static = make_static!(i2c0_bus);
 
-    let mut i2c0_dev1 = asynch::i2c::I2cDevice::new(i2c0_bus_static);
-    let has_tsc2007 = i2c0_dev1.read(TSC2007_ADDR, &mut [0]).await.is_ok();
+    let mut i2c0_dev0 = asynch::i2c::I2cDevice::new(i2c0_bus_static);
+    let has_tsc2007 = i2c0_dev0.read(TSC2007_ADDR, &mut [0]).await.is_ok();
     println!("has_tsc2007 = {}", has_tsc2007);
-    let has_ft6206 = i2c0_dev1.read(FT6236_DEFAULT_ADDR, &mut [0]).await.is_ok();
+    let has_ft6206 = i2c0_dev0.read(FT6236_DEFAULT_ADDR, &mut [0]).await.is_ok();
     println!("has_ft6206 = {}", has_ft6206);
 
     let sclk = io.pins.gpio5;
@@ -1123,8 +1088,6 @@ async fn main(spawner: Spawner) {
 
     let display_cs = io.pins.gpio15.into_push_pull_output();
     let sd_cs = io.pins.gpio14.into_push_pull_output();
-
-    let mut rst = DummyPin;
 
     let spi2 = Spi::new(peripherals.SPI2, 20u32.MHz(), SpiMode::Mode0, clocks)
         .with_pins(Some(sclk), Some(mosi), Some(miso), NO_PIN);
@@ -1139,28 +1102,23 @@ async fn main(spawner: Spawner) {
         spi2_bus_static,
         DummyPin);
 
-    let spi_iface = SPIInterfaceNoCS::new(display_spi, dc);
+    let spi_iface = SPIInterface::new(display_spi, dc);
 
     let mut delay = Delay;
 
-    let display_orientation = Orientation::Landscape;
-    let display_size = DisplaySize240x320;
+    let mut display = Builder::new(ILI9341Rgb565, spi_iface)
+        .orientation(Orientation::new().rotate(Rotation::Deg270).flip_horizontal())
+        .color_order(ColorOrder::Bgr)
+        .display_size(240, 320)
+        .init(&mut delay).unwrap();
 
-    let mut display = Ili9341::new(
-        spi_iface,
-        &mut rst,
-        &mut delay,
-        display_orientation,
-        display_size,
-    ).unwrap();
-
+    let display_width = display.size().width;
+    let display_height = display.size().height;
+    let display_rotation = display.orientation().rotation;
 
     let theme = Theme::new_light_theme();
     let mut character_styles = CharacterStyles::new_with_color(theme.text_color_primary);
     character_styles.set_background_color(theme.screen_background_color);
-
-    let display_width = display.width() as u32;
-    let display_height = display.height() as u32;
 
     let icon_left_area = Rectangle::new(get_left_button_pos(display_width, display_height), GraphicUtils::get_button_size());
     let icon_right_area = Rectangle::new(get_right_button_pos(display_width, display_height), GraphicUtils::get_button_size());
@@ -1246,7 +1204,7 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(500)).await;
     }
 
-    display.clear_screen(theme.screen_background_color).unwrap();
+    display.clear(theme.screen_background_color).unwrap();
 
     let dma = Dma::new(peripherals.DMA);
     let dma_channel = dma.i2s0channel;
@@ -1260,7 +1218,7 @@ async fn main(spawner: Spawner) {
         Standard::Philips,
         DataFormat::Data16Channel16,
         44100u32.Hz(),
-        dma_channel.configure(
+        dma_channel.configure_for_async(
             false,
             tx_descriptors,
             rx_descriptors,
@@ -1270,10 +1228,11 @@ async fn main(spawner: Spawner) {
     );
 
     if station_list.len() == 0 {
-        station_list.push(RadioStation::new("FM4", "http://orf-live.ors-shoutcast.at/fm4-q2a"));
-        station_list.push(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
-        station_list.push(RadioStation::new("Terry Callaghan's Classic Alternative Channel", "http://s16.myradiostream.com:7304"));
-        station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+        // station_list.push(RadioStation::new("FM4", "http://orf-live.ors-shoutcast.at/fm4-q2a"));
+        // station_list.push(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
+        // station_list.push(RadioStation::new("Terry Callaghan's Classic Alternative Channel", "http://s16.myradiostream.com:7304"));
+        // station_list.push(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+        station_list.push(RadioStation::new("local", "http://192.168.1.70:8001/stream"));
     }
 
     let mut mp3file_mode = if mp3file_list.len() != 0 { true } else { false };
@@ -1310,11 +1269,21 @@ async fn main(spawner: Spawner) {
     //     spawner.must_spawn(handle_play_mp3_from_sd(sdcard_manager, clocks));
     // }
 
-    if has_tsc2007 {
-        spawner.must_spawn(handle_tp_touch_tsc2007(i2c0_dev1, io.pins.gpio32, display_orientation, display_width as u16, display_height as u16));
-    } else if has_ft6206 {
-        spawner.must_spawn(handle_tp_touch_ft6206(i2c0_dev1, io.pins.gpio32, display_orientation, display_width as u16, display_height as u16));
+    if has_ft6206 {
+        spawner.must_spawn(handle_tp_touch_ft6206(i2c0_dev0, io.pins.gpio32, display_rotation, display_width as u16, display_height as u16));
     }
+
+    // if has_ft6206 {
+    //     let mut cpu_control = CpuControl::new(system.cpu_control);
+    //     let _guard = cpu_control
+    //         .start_app_core(unsafe { &mut APP_CORE_STACK }, move || {
+    //             let executor = make_static!(Executor::new());
+    //             executor.run(|spawner| {
+    //                 spawner.must_spawn(handle_tp_touch_ft6206(i2c0_dev0, io.pins.gpio32, display_rotation, display_width as u16, display_height as u16));
+    //             })
+    //         })
+    //         .unwrap();
+    // }
 
     // let mut file_written = 0;
     // let mut file_done = false;
@@ -1486,7 +1455,7 @@ async fn main(spawner: Spawner) {
             if icon_middle_area.contains(touch_point) {
                 if current_screen == 0 {
                     current_screen = 1;
-                    display.clear_screen(theme.screen_background_color).unwrap();
+                    display.clear(theme.screen_background_color).unwrap();
                     // show current meta data
                     META_DATA_SIGNAL.signal(meta_data.clone());
 
@@ -1500,7 +1469,7 @@ async fn main(spawner: Spawner) {
                     display_play_navigation(&mut display, display_width, display_height, &status, &theme).unwrap();
                 } else if current_screen == 1 {
                     current_screen = 0;
-                    display.clear_screen(theme.screen_background_color).unwrap();
+                    display.clear(theme.screen_background_color).unwrap();
 
                     if mp3file_mode {
                         mp3file_select_list.draw(&mut display).unwrap();
@@ -1515,7 +1484,7 @@ async fn main(spawner: Spawner) {
                     if mp3file_select_list.get_bounding_box().contains(touch_point) {
                         if let Ok(selected_index) = mp3file_select_list.select_at_pos(&mut display, touch_point) {
                             current_screen = 1;
-                            display.clear_screen(theme.screen_background_color).unwrap();
+                            display.clear(theme.screen_background_color).unwrap();
                             // show current meta data
                             META_DATA_SIGNAL.signal(meta_data.clone());
 
@@ -1529,7 +1498,7 @@ async fn main(spawner: Spawner) {
                     if radio_select_list.get_bounding_box().contains(touch_point) {
                         if let Ok(selected_index) = radio_select_list.select_at_pos(&mut display, touch_point) {
                             current_screen = 1;
-                            display.clear_screen(theme.screen_background_color).unwrap();
+                            display.clear(theme.screen_background_color).unwrap();
                             // show current meta data
                             META_DATA_SIGNAL.signal(meta_data.clone());
 
