@@ -6,10 +6,10 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-esp-hal = { version = "0.16.1", features = ["esp32", "embassy", "embassy-time-timg0", "embassy-executor-thread", "async", "psram-2m"] }
+esp-hal = { version = "0.17.0", features = ["esp32", "embassy", "embassy-time-timg0", "async", "psram-2m", "embassy-executor"] }
 esp-backtrace = { version = "0.11.1", features = ["esp32", "panic-handler", "exception-handler", "colors", "println"] }
 esp-println = { version = "0.9.1", features = ["esp32", "log"] }
-esp-wifi = { version = "0.4.0", features = ["esp32", "wifi", "embassy-net"] }
+esp-wifi = { version = "0.5.1", features = ["esp32", "wifi", "embassy-net"] }
 heapless = { version = "0.8.0", default-features = false, features = ["serde"] }
 log = { version = "0.4.18" }
 esp-alloc = { version = "0.3.0" }
@@ -23,7 +23,7 @@ embassy-futures = "0.1.1"
 embedded-graphics = "0.8.1"
 embedded-svc = { version = "0.27.0", default-features = false, features = ["log", "use_serde"] }
 embedded-hal = "1.0.0"
-embedded-hal-bus = { version = "0.1.0", features = ["async"] }
+embedded-hal-bus = { version = "0.2.0", features = ["async"] }
 embedded-hal-async = "1.0.0"
 embedded-sdmmc = { version = "0.7.0" }
 reqwless = { version = "0.11.0", features = ["alloc"] }

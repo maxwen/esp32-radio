@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::RefCell;
 use core::fmt::Write;
+use core::ptr::addr_of_mut;
 use core::str::from_utf8_unchecked;
 
 use display_interface_spi::SPIInterface;
@@ -48,20 +49,23 @@ use esp32_utils_crate::graphics::{Button, GraphicUtils, Label, ListItem, Progres
 use esp32_utils_crate::sdcard::SdcardManager;
 use esp32_utils_crate::tsc2007::TSC2007_ADDR;
 use esp_backtrace;
-use esp_hal::{Async, Blocking, clock::ClockControl, embassy, peripherals::Peripherals, prelude::*, psram};
+use esp_hal::{Async, clock::ClockControl, embassy, get_core, peripherals::Peripherals, prelude::*, psram};
 use esp_hal::clock::Clocks;
+use esp_hal::cpu_control::CpuControl;
 use esp_hal::dma::{DmaDescriptor, DmaPriority};
 use esp_hal::dma::{Dma, I2s0DmaChannel};
-use esp_hal::gpio::{GpioPin, IO, NO_PIN, Output, PushPull, Unknown};
+use esp_hal::embassy::executor::Executor;
+use esp_hal::gpio::{GpioPin, Input, Io, NO_PIN, Output, Pull};
 use esp_hal::i2c::I2C;
 use esp_hal::i2s::{DataFormat, I2s, Standard};
 use esp_hal::i2s::asynch::I2sWriteDmaAsync;
-use esp_hal::ledc::{channel, HighSpeed, LEDC, timer};
+use esp_hal::ledc::{channel, HighSpeed, Ledc, timer};
 use esp_hal::peripherals::{I2C0, I2S0, SPI2};
 use esp_hal::rng::Rng;
 use esp_hal::spi::{FullDuplexMode, SpiMode};
 use esp_hal::spi::master::{Instance, Spi};
-use esp_hal::timer::TimerGroup;
+use esp_hal::system::SystemControl;
+use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize};
 use esp_wifi::wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
@@ -112,7 +116,7 @@ const SILENCE_SHORT_DELAY_FRAMES: u64 = 32;
 const SCREEN_TIMEOUT_SECS: u64 = 30;
 const SCREEN_BRIGHTNESS_PERCENT: u8 = 30;
 
-// static mut APP_CORE_STACK: esp_hal::cpu_control::Stack<8192> = esp_hal::cpu_control::Stack::new();
+static mut APP_CORE_STACK: esp_hal::cpu_control::Stack<8192> = esp_hal::cpu_control::Stack::new();
 
 #[derive(Debug, Clone)]
 struct MetaData {
@@ -683,8 +687,8 @@ pub async fn handle_radio_stream(stack: &'static Stack<WifiDevice<'static, WifiS
 }
 
 #[embassy_executor::task]
-pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel, Async,>, bclk_pin: GpioPin<Unknown, 26>, ws_pin: GpioPin<Unknown, 25>,
-                                 dout_pin: GpioPin<Unknown, 27>) {
+pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel, Async, >, bclk_pin: GpioPin<26>, ws_pin: GpioPin<25>,
+                                 dout_pin: GpioPin<27>) {
     let i2s_tx = i2s
         .i2s_tx
         .with_bclk(bclk_pin)
@@ -739,10 +743,10 @@ pub async fn handle_frame_stream(i2s: I2s<'static, I2S0, I2s0DmaChannel, Async,>
 }
 
 #[embassy_executor::task]
-async fn handle_tp_touch_ft6206(i2c: asynch::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0, Async>>, tp_irq_pin: GpioPin<Unknown, 32>,
+async fn handle_tp_touch_ft6206(i2c: asynch::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2C<'static, I2C0, Async>>, tp_irq_pin: GpioPin<32>,
                                 orientation: Rotation, width: u16, height: u16) {
     let mut ft6206 = FT6236::new(i2c);
-    let mut tp_irq_input = tp_irq_pin.into_pull_down_input();
+    let mut tp_irq_input = Input::new(tp_irq_pin, Pull::Down);
 
     loop {
         tp_irq_input.wait_for_low().await;
@@ -771,7 +775,7 @@ async fn handle_tp_touch_ft6206(i2c: asynch::i2c::I2cDevice<'static, CriticalSec
 }
 
 #[embassy_executor::task]
-async fn handle_play_mp3_from_sd(sdcard_manager: &'static mut SdcardManager<SdCard<blocking::spi::SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI2, FullDuplexMode>, DummyPin>, GpioPin<Output<PushPull>, 14>, Delay>>, clocks: &'static Clocks<'static>) {
+async fn handle_play_mp3_from_sd(sdcard_manager: &'static mut SdcardManager<SdCard<blocking::spi::SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI2, FullDuplexMode>, DummyPin>, Output<'static, GpioPin<14>>, Delay>>) {
     let data_buffer_layout = Layout::array::<u8>(STREAM_BUFFER_SIZE).unwrap();
     let data_buffer_ptr = unsafe { ALLOCATOR.alloc(data_buffer_layout) };
     let data_buffer = unsafe { core::slice::from_raw_parts_mut(data_buffer_ptr, data_buffer_layout.size()) };
@@ -1007,6 +1011,14 @@ pub fn from_ascii(bytes: &[u8]) -> Result<&str, &'static str> {
     }
 }
 
+#[embassy_executor::task]
+async fn foo() {
+    loop {
+        println!("Running foo() on core {}", get_core() as usize);
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
+
 #[main]
 async fn main(spawner: Spawner) {
     let peripherals = Peripherals::take();
@@ -1014,8 +1026,7 @@ async fn main(spawner: Spawner) {
     psram::init_psram(peripherals.PSRAM);
     init_psram_heap();
 
-    let system = peripherals.SYSTEM.split();
-
+    let system = SystemControl::new(peripherals.SYSTEM);
     let clocks = singleton!(
         ClockControl::max(system.clock_control).freeze(),
         Clocks
@@ -1024,21 +1035,31 @@ async fn main(spawner: Spawner) {
     let timer_group0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
     embassy::init(&clocks, timer_group0);
 
-    let timer_group1 = TimerGroup::new(peripherals.TIMG1, &clocks, None);
+    let timer0 = TimerGroup::new(peripherals.TIMG1, &clocks, None).timer0;
     let mut rng = Rng::new(peripherals.RNG);
     let _init = initialize(
         EspWifiInitFor::Wifi,
-        timer_group1.timer0,
+        timer0,
         rng,
-        system.radio_clock_control,
+        peripherals.RADIO_CLK,
         &clocks,
     ).unwrap();
 
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+    let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
+    let bl_pin = io.pins.gpio4;
+    let i2c_power_pin = io.pins.gpio2;
+    let i2c_sda_pin = io.pins.gpio22;
+    let i2c_scl_pin = io.pins.gpio20;
+    let tp_irq_pin = io.pins.gpio32;
+    let spi_miso_pin = io.pins.gpio21;
+    let spi_mosi_pin = io.pins.gpio19;
+    let spi_scl_pin = io.pins.gpio5;
+    let spi_tft_dc_pin = io.pins.gpio33;
+    let spi_tft_cs_pin = io.pins.gpio15;
+    let spi_sd_cs_pin = io.pins.gpio14;
 
     // backlight
-    let bl_pin = io.pins.gpio4.into_push_pull_output();
-    let mut ledc = LEDC::new(
+    let mut ledc = Ledc::new(
         peripherals.LEDC,
         &clocks);
 
@@ -1061,14 +1082,13 @@ async fn main(spawner: Spawner) {
         .unwrap();
 
     // enable i2c_power
-    let i2c_power = io.pins.gpio2;
-    i2c_power.into_push_pull_output().set_high();
+    Output::new(i2c_power_pin, true);
 
     let i2c0 = I2C::new_async(
         peripherals.I2C0,
-        io.pins.gpio22,
-        io.pins.gpio20,
-        100u32.kHz(),
+        i2c_sda_pin,
+        i2c_scl_pin,
+        40u32.kHz(),
         clocks,
     );
 
@@ -1081,13 +1101,13 @@ async fn main(spawner: Spawner) {
     let has_ft6206 = i2c0_dev0.read(FT6236_DEFAULT_ADDR, &mut [0]).await.is_ok();
     println!("has_ft6206 = {}", has_ft6206);
 
-    let sclk = io.pins.gpio5;
-    let miso = io.pins.gpio21;
-    let mosi = io.pins.gpio19;
-    let dc = io.pins.gpio33.into_push_pull_output();
+    let sclk = spi_scl_pin;
+    let miso = spi_miso_pin;
+    let mosi = spi_mosi_pin;
+    let dc = Output::new(spi_tft_dc_pin, false);
 
-    let display_cs = io.pins.gpio15.into_push_pull_output();
-    let sd_cs = io.pins.gpio14.into_push_pull_output();
+    let display_cs = Output::new(spi_tft_cs_pin, false);
+    let sd_cs = Output::new(spi_sd_cs_pin, false);
 
     let spi2 = Spi::new(peripherals.SPI2, 20u32.MHz(), SpiMode::Mode0, clocks)
         .with_pins(Some(sclk), Some(mosi), Some(miso), NO_PIN);
@@ -1165,6 +1185,17 @@ async fn main(spawner: Spawner) {
         }
     }
     sdcard_manager.close_root_dir().unwrap();
+
+    // let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
+    // let _guard = cpu_control
+    //     .start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, move || {
+    //         static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+    //         let executor = EXECUTOR.init(Executor::new());
+    //         executor.run(|spawner| {
+    //             spawner.spawn(foo()).ok();
+    //         });
+    //     })
+    //     .unwrap();
 
     progress.update_text(&mut display, "Connecting to Wifi...").unwrap();
 
@@ -1266,24 +1297,12 @@ async fn main(spawner: Spawner) {
     //     spawner.must_spawn(handle_radio_stream(stack));
     // }
     // if mp3file_mode {
-    //     spawner.must_spawn(handle_play_mp3_from_sd(sdcard_manager, clocks));
+    //     spawner.must_spawn(handle_play_mp3_from_sd(sdcard_manager));
     // }
 
     if has_ft6206 {
-        spawner.must_spawn(handle_tp_touch_ft6206(i2c0_dev0, io.pins.gpio32, display_rotation, display_width as u16, display_height as u16));
+        spawner.must_spawn(handle_tp_touch_ft6206(i2c0_dev0, tp_irq_pin, display_rotation, display_width as u16, display_height as u16));
     }
-
-    // if has_ft6206 {
-    //     let mut cpu_control = CpuControl::new(system.cpu_control);
-    //     let _guard = cpu_control
-    //         .start_app_core(unsafe { &mut APP_CORE_STACK }, move || {
-    //             let executor = make_static!(Executor::new());
-    //             executor.run(|spawner| {
-    //                 spawner.must_spawn(handle_tp_touch_ft6206(i2c0_dev0, io.pins.gpio32, display_rotation, display_width as u16, display_height as u16));
-    //             })
-    //         })
-    //         .unwrap();
-    // }
 
     // let mut file_written = 0;
     // let mut file_done = false;
@@ -1329,7 +1348,7 @@ async fn main(spawner: Spawner) {
         } else if icon_right_area.contains(touch_point) {
             mp3file_mode = true;
             current_screen = 0;
-            spawner.must_spawn(handle_play_mp3_from_sd(sdcard_manager, clocks));
+            spawner.must_spawn(handle_play_mp3_from_sd(sdcard_manager));
             mp3file_select_list.draw(&mut display).unwrap();
             display_list_navigation(&mut display, display_width, display_height, &theme).unwrap();
         }
